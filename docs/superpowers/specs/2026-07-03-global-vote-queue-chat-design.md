@@ -4,7 +4,7 @@
 
 Add a public, fair, global vote queue and a lightweight chat for connected users.
 
-Every vote submission must pass through one shared rate limit: one upstream vote every 2 seconds. Connected users should be able to see which avatar is queued for which vote submission. A single user identity, keyed by `clientId`, may only have one active connection at a time; newer sessions replace older sessions.
+Every vote submission must pass through one shared rate limit: one upstream vote every 2 seconds. Connected users should be able to see which avatar is queued for which vote submission. A single user identity, keyed by `clientId`, may only have one active connection at a time; newer sessions replace older sessions. A single IP address may also only have one active profile at a time; newer sessions from that IP replace older profiles and sessions.
 
 ## Existing Context
 
@@ -16,14 +16,18 @@ This design extends that model. It keeps the browser's current per-station vote 
 
 Each page load creates a fresh `sessionId` while keeping the saved `clientId`.
 
-The presence record for a `clientId` stores the newest `sessionId`. When a newer session posts presence, it becomes the only active session for that `clientId`. Older sessions are not silently allowed to continue:
+The server derives a normalized `ipKey` from trusted deployment headers. On Netlify this should prefer the platform client IP header and fall back to the first `x-forwarded-for` address when needed. The raw IP is not exposed in public snapshots.
+
+The presence record for a `clientId` stores the newest `sessionId` and `ipKey`. When a newer session posts presence, it becomes the only active session for that `clientId`. When a newer session posts presence from an `ipKey`, it becomes the only active profile for that IP. Older sessions and older profiles are not silently allowed to continue:
 
 - Presence snapshots include enough information for the browser to detect that its `sessionId` is no longer active.
 - Old sessions stop polling, voting, and chatting.
 - The UI shows a blocking replaced-session state.
 - Vote and chat endpoints reject stale sessions with a clear `409` response.
 
-The uniqueness rule is only keyed by `clientId`. Handles and avatars are public labels, not authentication factors.
+The uniqueness rules are keyed by `clientId` and `ipKey`. Handles and avatars are public labels, not authentication factors.
+
+The IP rule is strict. If two different saved profiles connect from the same IP, the newest profile replaces the older one. This may collapse multiple users behind the same NAT into one active profile, but it prevents profile floods from one address.
 
 ## Fair Vote Queue
 
@@ -32,6 +36,7 @@ The queue is stored in Netlify Blobs with strong consistency. Each queued vote e
 - queue id
 - `clientId`
 - `sessionId`
+- `ipKey`, stored for validation but not exposed publicly
 - handle
 - avatar
 - source service
@@ -47,8 +52,9 @@ The frontend still submits one station per `/api/vote` request. For bulk voting,
 Server-side scheduling is fair across users:
 
 - A `clientId` may have at most one active queued or processing vote at a time.
-- If that user submits another vote while their prior vote is still queued or processing, the request waits outside the public queue until the prior entry completes.
-- The next public queue entry is selected round-robin across `clientId`s, not by one user's full batch order.
+- An `ipKey` may have at most one active queued or processing vote at a time.
+- If that user or IP submits another vote while their prior vote is still queued or processing, the request waits outside the public queue until the prior entry completes.
+- The next public queue entry is selected round-robin across `clientId`s and bounded by `ipKey`, not by one user's full batch order.
 - A global timestamp enforces at least 2 seconds between upstream vote submissions.
 
 This lets a user run a large batch while still allowing other connected avatars to be interleaved as they arrive.
@@ -93,10 +99,12 @@ If queue or chat snapshots fail to load, the UI keeps the last rendered snapshot
 Tests should be added before implementation for:
 
 - session records accepting the newest `sessionId` for a `clientId`
-- stale sessions being detectable and rejected
+- session records accepting the newest profile for an `ipKey`
+- stale sessions and replaced IP profiles being detectable and rejected
 - queue entries exposing only public fields
 - one active queued or processing vote per `clientId`
-- fair selection rotating across `clientId`s
+- one active queued or processing vote per `ipKey`
+- fair selection rotating across `clientId`s while respecting `ipKey` bounds
 - the 2 second global interval being enforced with injected time
 - chat message normalization and stale-session rejection
 - frontend rendering of queue/chat snapshots
