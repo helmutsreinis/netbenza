@@ -39,6 +39,19 @@ function loadFrontendHarness(options = {}) {
     <button id="vote-selected-btn">Vote Selected (<span id="vote-sel-count">0</span>)</button>
     <button id="vote-btn">Vote ALL (<span id="vote-all-count">0</span> filtered)</button>
     <select id="vote-status"><option value=""></option><option value="yes">yes</option></select>
+    <select id="comment-mode"><option value="custom">custom</option><option value="positive">positive</option><option value="negative">negative</option></select>
+    <textarea id="vote-text"></textarea>
+    <input id="vote-onsite" type="checkbox">
+    <input id="lat-input">
+    <input id="lon-input">
+    <input id="city-input">
+    <div id="progress-bar" hidden>
+      <div id="progress-fill"></div>
+      <span id="progress-text"></span>
+      <span id="progress-pct"></span>
+      <span id="progress-current"></span>
+      <span id="progress-badge"></span>
+    </div>
     <div id="stats-summary"></div>
     <div id="stats-selected"></div>
     <button id="service-switch" hidden>Services</button>
@@ -260,6 +273,62 @@ describe('frontend DOM updates', () => {
     assert.equal(dom.window.document.getElementById('vote-sel-count')?.textContent, '2');
     assert.equal(dom.window.document.getElementById('vote-all-count')?.textContent, '12');
     assert.match(dom.window.document.getElementById('vote-btn')?.textContent || '', /12 filtered/);
+  });
+
+  it('includes active presence session identity in vote request payloads', async () => {
+    const voteBodies = [];
+    const { context, dom } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        if (String(url).startsWith('/api/stations/ids')) {
+          return { ok: true, json: async () => ({ ids: ['201'], total: 1 }) };
+        }
+        if (String(url) === '/api/vote') {
+          voteBodies.push(JSON.parse(options.body));
+          return {
+            ok: true,
+            json: async () => ([{ osm_id: voteBodies.length === 1 ? '201' : '301', success: true, reason: '' }]),
+          };
+        }
+        if (String(url) === '/api/presence') return { ok: true, json: async () => ({ users: [] }) };
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    try {
+      vm.runInContext(`
+        state.identity = {
+          clientId: 'client-front',
+          sessionId: 'session-front',
+          sessionStartedAt: 12345,
+          fingerprint: 'fingerprint-front',
+          handle: 'Frontend Operator',
+          avatar: '/avatars/front.png'
+        };
+        state.source = 'benzin';
+        state.searchParams = new URLSearchParams('source=benzin');
+        state.totalFiltered = 1;
+        document.getElementById('vote-status').value = 'yes';
+        document.getElementById('comment-mode').value = 'custom';
+        document.getElementById('vote-text').value = 'frontend note';
+      `, context);
+
+      await vm.runInContext('doVote()', context);
+
+      vm.runInContext(`
+        document.getElementById('vote-status').value = 'yes';
+        state.allSelected.add('301');
+      `, context);
+      await vm.runInContext('doVoteSelected()', context);
+
+      assert.equal(voteBodies.length, 2);
+      assert.deepEqual(voteBodies.map((body) => body.clientId), ['client-front', 'client-front']);
+      assert.deepEqual(voteBodies.map((body) => body.sessionId), ['session-front', 'session-front']);
+      assert.deepEqual(voteBodies.map((body) => body.handle), ['Frontend Operator', 'Frontend Operator']);
+      assert.deepEqual(voteBodies.map((body) => body.avatar), ['/avatars/front.png', '/avatars/front.png']);
+    } finally {
+      vm.runInContext('clearTimeout(state.idleTimer); stopPresenceTimers();', context);
+      dom.window.close();
+    }
   });
 
   it('renders Potemkin video standby when GdeBenz cannot be reached', () => {

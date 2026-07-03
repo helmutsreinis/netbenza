@@ -1,7 +1,7 @@
 import { STATUSES, resolveCoords, submitVote } from './lib/gdebenz-client.mjs';
 import { BENZIN_STATUSES, submitBenzinReport } from './lib/benzin-client.mjs';
 import { assertRequestAccess } from './lib/access-gate-store.mjs';
-import { assertActiveSession, getPresenceStore } from './lib/presence-store.mjs';
+import { assertActiveSession, getPresenceStore, presenceSnapshot } from './lib/presence-store.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/http.mjs';
 import { requestIpKey } from './lib/request-context.mjs';
 import { getVoteQueueStore, runQueuedVote } from './lib/vote-queue-store.mjs';
@@ -23,8 +23,6 @@ function voteIdentity(req, body = {}) {
   return {
     clientId: body.clientId,
     sessionId: body.sessionId,
-    handle: body.handle,
-    avatar: body.avatar,
     ipKey: requestIpKey(req),
   };
 }
@@ -32,8 +30,37 @@ function voteIdentity(req, body = {}) {
 async function assertVoteSession(req, body, options, nowFn) {
   const identity = voteIdentity(req, body);
   const presenceStore = options.presenceStore || getPresenceStore();
-  await assertActiveSession(presenceStore, identity, currentNow(options, nowFn));
-  return identity;
+  const now = currentNow(options, nowFn);
+  await assertActiveSession(presenceStore, identity, now);
+  const snapshot = await presenceSnapshot(presenceStore, now, identity);
+  const activeUser = (snapshot.users || []).find((user) => user.clientId === identity.clientId);
+  return {
+    ...identity,
+    handle: activeUser?.handle || 'Anonymous',
+    avatar: activeUser?.avatar || '',
+  };
+}
+
+const QUEUE_ROUTE_ERROR_CODES = new Set([
+  'client_active',
+  'clientId_required',
+  'id_required',
+  'ip_active',
+  'ipKey_required',
+  'queue_entry_invalid',
+  'queue_entry_missing',
+  'queue_wait_timeout',
+  'sessionId_required',
+  'stationId_required',
+  'status_required',
+  'submit_required',
+]);
+
+function queueRouteErrorResponse(error) {
+  const status = Number(error?.status);
+  const code = String(error?.code || error?.message || '');
+  if (!Number.isInteger(status) || status < 400 || !QUEUE_ROUTE_ERROR_CODES.has(code)) return null;
+  return errorResponse(status, code || 'vote_queue_failed');
 }
 
 export async function handleVoteRequest(req, options = {}) {
@@ -85,6 +112,8 @@ export async function handleVoteRequest(req, options = {}) {
           }),
         }));
       } catch (error) {
+        const routeError = queueRouteErrorResponse(error);
+        if (routeError) return routeError;
         results.push({
           osm_id: stationId,
           name: `Station #${stationId}`,
@@ -137,6 +166,8 @@ export async function handleVoteRequest(req, options = {}) {
         submit: async (vote) => submitVote(vote),
       }));
     } catch (error) {
+      const routeError = queueRouteErrorResponse(error);
+      if (routeError) return routeError;
       results.push({
         osm_id: stationId,
         name: '',

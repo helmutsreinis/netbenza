@@ -422,6 +422,17 @@ function ensurePresenceSession() {
   return state.identity;
 }
 
+function voteIdentityPayload() {
+  const identity = ensurePresenceSession();
+  if (!identity) return {};
+  return {
+    clientId: identity.clientId,
+    sessionId: identity.sessionId,
+    handle: identity.handle,
+    avatar: identity.avatar,
+  };
+}
+
 function saveIdentity(event) {
   event.preventDefault();
   const handle = $('#identity-handle').value.trim();
@@ -1262,6 +1273,7 @@ async function doVote() {
           city: city, lat: lat, lon: lon,
           source: state.source || 'gdebenz',
           fingerprint: state.identity?.fingerprint || state.identity?.clientId || '',
+          ...voteIdentityPayload(),
         }),
       });
       const r = resp[0] || { osm_id: osmId, name: osmId, success: false, reason: 'no response' };
@@ -1349,6 +1361,7 @@ async function doVoteSelected() {
           on_site: $('#vote-onsite').checked, city, lat, lon,
           source: state.source || 'gdebenz',
           fingerprint: state.identity?.fingerprint || state.identity?.clientId || '',
+          ...voteIdentityPayload(),
         }),
       });
       const r = resp[0] || { osm_id: osmId, name: osmId, success: false, reason: 'no response' };

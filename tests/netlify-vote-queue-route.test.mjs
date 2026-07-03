@@ -13,7 +13,9 @@ import {
 import {
   createVoteQueueEntry,
   enqueueVoteEntry,
+  markVoteEntryProcessing,
   readQueueState,
+  removeVoteEntry,
 } from '../netlify/functions/lib/vote-queue-store.mjs';
 import { handleVoteRequest } from '../netlify/functions/vote.mjs';
 import voteQueueHandler, { handleVoteQueueRequest } from '../netlify/functions/vote-queue.mjs';
@@ -169,6 +171,87 @@ describe('Netlify vote queue routes', () => {
     assert.equal(JSON.stringify(queue).includes('session-one'), false);
   });
 
+  it('uses active presence display identity instead of vote body identity in public queue', async () => {
+    let now = 1_500_000;
+    const access = await accessContext({ now, ip: '198.51.100.52' });
+    const presenceStore = new MemoryPresenceStore();
+    const queueStore = new MemoryPresenceStore();
+    const blocker = createVoteQueueEntry({
+      identity: {
+        clientId: 'blocker',
+        sessionId: 'blocker-session',
+        ipKey: 'ip:203.0.113.200',
+        handle: 'Blocker',
+        avatar: '/avatars/blocker.png',
+      },
+      vote: { source: 'benzin', stationId: '900', status: 'available' },
+      now,
+      id: 'processing-blocker',
+    });
+    let inspectedSnapshot = null;
+
+    await enqueueVoteEntry(queueStore, blocker, now);
+    await markVoteEntryProcessing(queueStore, blocker.id, now);
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+      handle: 'Presence Operator',
+      avatar: '/avatars/presence.png',
+    });
+
+    await withMockFetch(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }), async () => {
+      const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
+        method: 'POST',
+        headers: { ...access.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          source: 'benzin',
+          osm_ids: ['123'],
+          vote_status: 'available',
+          clientId: 'client-one',
+          sessionId: 'session-one',
+          handle: 'Spoofed Operator',
+          avatar: '/avatars/spoofed.png',
+        }),
+      }), {
+        accessStore: access.store,
+        presenceStore,
+        queueStore,
+        nowFn: () => now,
+        sleep: async (ms) => {
+          if (!inspectedSnapshot) {
+            const queueResponse = await handleVoteQueueRequest(new Request('http://localhost/api/vote/queue', {
+              method: 'GET',
+              headers: access.headers,
+            }), {
+              accessStore: access.store,
+              queueStore,
+              nowFn: () => now,
+            });
+            inspectedSnapshot = await queueResponse.json();
+            await removeVoteEntry(queueStore, blocker.id, {}, now);
+          }
+          now += ms;
+        },
+        maxWaitMs: 5_000,
+      });
+
+      assert.equal(response.status, 200);
+      await response.json();
+    });
+
+    assert.equal(inspectedSnapshot.entries[0].clientId, 'client-one');
+    assert.equal(inspectedSnapshot.entries[0].handle, 'Presence Operator');
+    assert.equal(inspectedSnapshot.entries[0].avatar, '/avatars/presence.png');
+    assert.equal(JSON.stringify(inspectedSnapshot).includes('Spoofed Operator'), false);
+    assert.equal(JSON.stringify(inspectedSnapshot).includes('/avatars/spoofed.png'), false);
+  });
+
   it('rejects stale sessions before enqueueing a vote', async () => {
     let now = 2_000_000;
     const access = await accessContext({ now });
@@ -233,6 +316,59 @@ describe('Netlify vote queue routes', () => {
     const state = await readQueueState(queueStore, now);
     assert.deepEqual(state.entries, []);
     assert.deepEqual(postedBodies, []);
+  });
+
+  it('returns a non-200 response when the queue runner times out before submission', async () => {
+    const now = 2_500_000;
+    const access = await accessContext({ now, ip: '198.51.100.60' });
+    const presenceStore = new MemoryPresenceStore();
+    const queueStore = new MemoryPresenceStore();
+    const blocker = createVoteQueueEntry({
+      identity: {
+        clientId: 'blocking-client',
+        sessionId: 'blocking-session',
+        ipKey: 'ip:198.51.100.60',
+        handle: 'Blocking Client',
+        avatar: '/avatars/blocking.png',
+      },
+      vote: { source: 'benzin', stationId: '321', status: 'available' },
+      now,
+      id: 'queued-blocker',
+    });
+
+    await enqueueVoteEntry(queueStore, blocker, now);
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+    });
+
+    const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
+      method: 'POST',
+      headers: { ...access.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'benzin',
+        osm_ids: ['123'],
+        vote_status: 'available',
+        clientId: 'client-one',
+        sessionId: 'session-one',
+      }),
+    }), {
+      accessStore: access.store,
+      presenceStore,
+      queueStore,
+      nowFn: () => now,
+      sleep: async () => {},
+      maxWaitMs: 0,
+    });
+    const body = await response.json();
+    const state = await readQueueState(queueStore, now);
+
+    assert.equal(response.status, 504);
+    assert.equal(body.detail, 'queue_wait_timeout');
+    assert.deepEqual(state.entries.map((entry) => entry.id), ['queued-blocker']);
   });
 
   it('protects the public queue snapshot with the access gate', async () => {
