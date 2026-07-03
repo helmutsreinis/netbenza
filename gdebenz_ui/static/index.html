@@ -4,9 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GdeBenz Bulk Voter</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
+<div class="site-background" aria-hidden="true"></div>
 
 <header>
   <div class="logo">
@@ -15,12 +17,39 @@
   </div>
   <div class="header-actions">
     <div id="online-users" class="online-users" aria-live="polite"></div>
+    <button id="service-switch" class="btn btn-sm btn-ghost service-switch" type="button" hidden>Services</button>
     <button id="identity-reset" class="btn btn-sm btn-ghost identity-reset" type="button">Profile</button>
     <span id="fp-indicator" class="badge" title="Current profile"></span>
   </div>
 </header>
 
 <main>
+  <!-- Service Picker -->
+  <section class="service-picker" id="service-picker" hidden>
+    <div class="service-hero">
+      <p class="service-kicker">Connected services</p>
+      <h1>Choose an operation console</h1>
+      <p>
+        Pick the service you want to work with. GdeBenz is live now; more connectors can join this launcher without changing the profile flow.
+      </p>
+    </div>
+    <div class="service-grid">
+      <button class="service-card" id="service-gdebenz-card" data-service="gdebenz" type="button">
+        <span class="service-card-status service-card-status-offline">Offline</span>
+        <span class="service-card-title">GdeBenz Voter</span>
+        <span class="service-card-copy">Upstream unavailable. GdeBenz.ru is currently unreachable. Try again later.</span>
+        <span class="service-card-action">Retry anyway</span>
+      </button>
+      <button class="service-card" id="service-benzin-card" data-service="benzin" type="button">
+        <span class="service-card-status">Live</span>
+        <span class="service-card-title">Benzin-Status.tech</span>
+        <span class="service-card-copy">Alternative fuel map. Status reports with fuel types, prices, deliveries, and queue tracking.</span>
+        <span class="service-card-action">Open service</span>
+      </button>
+    </div>
+  </section>
+
+  <section class="service-surface" id="gdebenz-service" hidden>
   <!-- Search Panel -->
   <section class="panel search-panel">
     <div class="search-row">
@@ -44,7 +73,7 @@
       </div>
       <div class="field field-sm">
         <label>RADIUS, KM</label>
-        <input type="number" id="radius-input" value="20" min="1" max="100" step="1">
+        <input type="number" id="radius-input" value="7" min="1" max="100" step="1">
       </div>
       <button id="search-btn" class="btn btn-primary">🔍 Search</button>
     </div>
@@ -87,8 +116,17 @@
     <span class="page-total" id="page-total"></span>
   </section>
 
-  <!-- Station List -->
-  <section class="station-list" id="station-list"></section>
+  <!-- Station List + Map -->
+  <section class="results-layout">
+    <section class="station-list" id="station-list"></section>
+    <aside class="results-map-panel" id="results-map-panel" hidden>
+      <div class="results-map-head">
+        <span>Current page map</span>
+        <small id="results-map-count">0 stations</small>
+      </div>
+      <div class="current-page-map" id="current-page-map" aria-label="Map of current page station results"></div>
+    </aside>
+  </section>
 
   <!-- Pagination (bottom) -->
   <section class="pagination" id="pagination-bot" style="display:none">
@@ -121,9 +159,14 @@
       <label class="checkbox-label" title="Mark as 'on-site'">
         <input type="checkbox" id="vote-onsite"> On-site
       </label>
-      <button id="vote-btn" class="btn btn-accent" disabled>
-        🗳 Vote (<span id="vote-count">0</span>)
-      </button>
+      <div class="vote-buttons">
+        <button id="vote-selected-btn" class="btn btn-accent-outline" disabled>
+          🗳 Vote Selected (<span id="vote-sel-count">0</span>)
+        </button>
+        <button id="vote-btn" class="btn btn-accent" disabled>
+          🗳 Vote ALL (<span id="vote-all-count">0</span> filtered)
+        </button>
+      </div>
     </div>
   </section>
 
@@ -145,6 +188,7 @@
 
   <!-- Results -->
   <section id="results-area"></section>
+  </section>
 </main>
 
 <!-- Status toast -->
@@ -166,6 +210,7 @@
   </form>
 </div>
 
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

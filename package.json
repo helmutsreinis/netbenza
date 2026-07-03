@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
+    "sync:video-reels": "node scripts/sync-video-reels.mjs",
     "check:functions": "node scripts/check-functions.mjs"
   },
   "dependencies": {

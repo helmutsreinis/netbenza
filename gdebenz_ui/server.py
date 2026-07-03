@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FastAPI server for GdeBenz.ru bulk voting UI.
+FastAPI server for GdeBenz.ru + Benzin-Status.tech bulk voting UI.
 Run: python3 server.py  →  http://localhost:8585
 """
 
@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
-# Add parent to path so we can import the wrapper
+# Add parent to path so we can import the wrappers
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from gdebenz_wrapper import (
@@ -22,6 +22,18 @@ from gdebenz_wrapper import (
     FUEL_GRADES,
     STATUSES,
 )
+from benzin_status_api import (
+    BenzinStatusAPI,
+    BenzinStation,
+    BenzinStation as BenzinStationData,
+    BENZIN_FUEL_GRADES,
+    BENZIN_STATUSES,
+    BENZIN_STATUS_LABELS_EN as BENZIN_LABELS,
+    BENZIN_DISPLAY_LABELS_EN as BENZIN_DISPLAY_LABELS,
+    DISPLAY_TO_REPORT_STATUS,
+    FUEL_MAP as BENZIN_FUEL_MAP,
+    FUEL_MAP_REVERSE as BENZIN_FUEL_MAP_REV,
+)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -30,14 +42,15 @@ from typing import Optional
 import uvicorn
 import requests
 
-app = FastAPI(title="GdeBenz Bulk Voter", version="1.0")
+app = FastAPI(title="GdeBenz Bulk Voter", version="2.0")
 
-# Global API client — fingerprint loaded from file
+# API clients
 FP_FILE = os.path.expanduser("~/.gdebenz_fp")
 _fp = None
 if os.path.exists(FP_FILE):
     _fp = open(FP_FILE).read().strip()
-api = GdebenzAPI(fingerprint=_fp)
+gdebenz_api = GdebenzAPI(fingerprint=_fp)
+benzin_api = BenzinStatusAPI()
 
 
 # ── Hardcoded Data ────────────────────────────────────────────
@@ -219,12 +232,13 @@ class StationOut(BaseModel):
 
 class VoteRequest(BaseModel):
     osm_ids: list[str]
-    vote_status: str  # yes, queue, low, no
+    vote_status: str  # yes, queue, low, no  OR  available, limited, unavailable, queue
     text: str = ""
     on_site: bool = False
     city: Optional[str] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
+    source: str = "gdebenz"
 
 
 class VoteResult(BaseModel):
@@ -297,13 +311,145 @@ def _gdebenz_unavailable(exc: Exception) -> HTTPException:
     )
 
 
+def _benzin_to_stationdict(s: BenzinStation) -> dict:
+    """Normalize BenzinStation → dict compatible with StationOut/ListResponse."""
+    return {
+        "osm_id": str(s.id),
+        "name": s.name,
+        "brand": s.brand,
+        "addr": s.address,
+        "lat": s.lat,
+        "lon": s.lng,
+        "status": s.status,
+        "status_label": s.status_label,
+        "fuels_now": ", ".join(s.fuel_list),
+        "fuel_list": s.fuel_list,
+        "confirmations": 1,
+        "distance_km": round(s.distance_km, 1),
+        "last_at": _ts_to_str(s.last_report_at),
+    }
+
+
+def _ts_to_str(ts_ms: int) -> str:
+    if not ts_ms:
+        return ""
+    import datetime
+    return datetime.datetime.fromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _resolve_coords_for_source(source: str, city: str = None, lat: float = None, lon: float = None) -> tuple:
+    """Resolve coordinates, falling back to geoip for gdebenz or Moscow for benzin."""
+    if lat is not None and lon is not None:
+        return lat, lon
+    if city:
+        if source == "benzin":
+            # Look up in hardcoded cities
+            for c in TOP_CITIES:
+                if c["name"].lower() == city.lower() or c["name_ru"].lower() == city.lower():
+                    return c["lat"], c["lon"]
+            # Try gdebenz city search as fallback
+            try:
+                cities = gdebenz_api.search_city(city)
+                if cities:
+                    c = cities[0]
+                    return float(c.get("lat", 55.75)), float(c.get("lon", 37.62))
+            except Exception:
+                pass
+            return 55.75, 37.62  # Moscow fallback
+        else:
+            # gdebenz path
+            try:
+                return resolve_coords(gdebenz_api, city=city)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"City '{city}' not found")
+    # No city, no coords — fallback
+    if source == "benzin":
+        return 55.75, 37.62
+    return resolve_coords(gdebenz_api)
+
+
+def _list_benzin_stations(clat: float, clon: float, radius: float, fuel: str, status: str, brand: str, offset: int, limit: int) -> ListResponse:
+    """Get benzin-status stations with filtering and pagination."""
+    try:
+        all_stations = benzin_api.get_stations(clat, clon, radius)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Could not reach Benzin-Status: {e}")
+
+    # Normalize to dicts
+    station_dicts = [_benzin_to_stationdict(s) for s in all_stations]
+
+    # Filter by fuel
+    if fuel:
+        fuel_set = set(f.strip() for f in fuel.split(","))
+        station_dicts = [s for s in station_dicts if fuel_set & set(s["fuel_list"])]
+
+    # Filter by status
+    if status:
+        status_set = set(s.strip() for s in status.split(","))
+        station_dicts = [s for s in station_dicts if s["status"] in status_set]
+
+    # Filter by brand
+    if brand:
+        brand_lower = brand.strip().lower()
+        station_dicts = [s for s in station_dicts if brand_lower in (s["brand"] or "").lower() or brand_lower in (s["name"] or "").lower()]
+
+    filtered_total = len(station_dicts)
+    pages = max(1, (filtered_total + limit - 1) // limit) if filtered_total > 0 else 1
+    page = offset // limit + 1 if limit > 0 else 1
+    page_items = station_dicts[offset:offset + limit] if limit > 0 else station_dicts
+
+    return ListResponse(
+        center={"lat": clat, "lon": clon, "radius": radius},
+        summary={"available": sum(1 for s in station_dicts if s["status"] == "available"),
+                 "limited": sum(1 for s in station_dicts if s["status"] == "limited"),
+                 "unavailable": sum(1 for s in station_dicts if s["status"] == "unavailable"),
+                 "queue": sum(1 for s in station_dicts if s["status"] == "queue"),
+                 "none": sum(1 for s in station_dicts if s["status"] == "none")},
+        total=len(all_stations),
+        filtered_total=filtered_total,
+        page=page,
+        pages=pages,
+        stations=[StationOut(**s) for s in page_items],
+    )
+
+
+def _vote_benzin(req: VoteRequest, text: str) -> list[VoteResult]:
+    """Execute votes against benzin-status.tech API."""
+    if req.vote_status not in BENZIN_STATUSES:
+        return [VoteResult(osm_id=req.osm_ids[0] if req.osm_ids else "", name="", success=False,
+                          reason=f"invalid status: {req.vote_status}")]
+
+    results = []
+    for osm_id in req.osm_ids:
+        try:
+            station_id = int(osm_id)
+            result = benzin_api.report(
+                station_id=station_id,
+                status=req.vote_status,
+            )
+            name = f"Station #{station_id}"
+            results.append(VoteResult(
+                osm_id=osm_id,
+                name=name,
+                success=result.get("success", False),
+                reason=result.get("reason", ""),
+            ))
+        except Exception as e:
+            results.append(VoteResult(osm_id=osm_id, name="", success=False, reason=str(e)))
+    return results
+
+
+# ── API Routes ───────────────────────────────────────────────
+
 @app.get("/api/config", response_model=ConfigOut)
-def get_config():
+def get_config(source: str = Query("gdebenz")):
+    fuel = BENZIN_FUEL_GRADES if source == "benzin" else FUEL_GRADES
+    labels = BENZIN_LABELS if source == "benzin" else STATUS_LABELS_EN
     return ConfigOut(
-        fuel_grades=FUEL_GRADES,
+        fuel_grades=fuel,
         statuses=[
-            {"value": s, "label": l, "color": _status_color(s)}
-            for s, l in STATUS_LABELS_EN.items()
+            {"value": s, "label": l, "color": _status_color(s) if source == "gdebenz" else _benzin_status_color(s)}
+            for s, l in labels.items()
         ],
         cities=TOP_CITIES,
         brands=TOP_BRANDS,
@@ -316,21 +462,23 @@ def list_stations(
     city: str = Query(None),
     lat: float = Query(None),
     lon: float = Query(None),
-    radius: float = Query(20),
+    radius: float = Query(7),
     fuel: str = Query(None),
     status: str = Query(None),
     brand: str = Query(None),
+    source: str = Query("gdebenz"),
     offset: int = Query(0),
     limit: int = Query(20),
 ):
     """List stations with filters and pagination."""
-    try:
-        clat, clon = resolve_coords(api, city=city, lat=lat, lon=lon)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    clat, clon = _resolve_coords_for_source(source, city=city, lat=lat, lon=lon)
 
+    if source == "benzin":
+        return _list_benzin_stations(clat, clon, radius, fuel, status, brand, offset, limit)
+
+    # ── GdeBenz ──
     try:
-        stations, summary = api.get_nearby(clat, clon, radius)
+        stations, summary = gdebenz_api.get_nearby(clat, clon, radius)
     except requests.exceptions.RequestException as e:
         raise _gdebenz_unavailable(e)
 
@@ -341,8 +489,6 @@ def list_stations(
     filtered_total = len(filtered)
     pages = max(1, (filtered_total + limit - 1) // limit) if filtered_total > 0 else 1
     page = offset // limit + 1 if limit > 0 else 1
-
-    # Slice for the current page
     page_stations = filtered[offset:offset + limit] if limit > 0 else filtered
 
     return ListResponse(
@@ -361,115 +507,86 @@ def list_station_ids(
     city: str = Query(None),
     lat: float = Query(None),
     lon: float = Query(None),
-    radius: float = Query(20),
+    radius: float = Query(7),
     fuel: str = Query(None),
     status: str = Query(None),
     brand: str = Query(None),
+    source: str = Query("gdebenz"),
 ):
-    """Return just osm_ids for ALL filtered stations (no pagination). Used for bulk voting."""
-    try:
-        clat, clon = resolve_coords(api, city=city, lat=lat, lon=lon)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Return just osm_ids for ALL filtered stations (no pagination)."""
+    clat, clon = _resolve_coords_for_source(source, city=city, lat=lat, lon=lon)
 
+    if source == "benzin":
+        try:
+            all_stations = benzin_api.get_stations(clat, clon, radius)
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"Could not reach Benzin-Status: {e}")
+        station_dicts = [_benzin_to_stationdict(s) for s in all_stations]
+        if fuel:
+            fuel_set = set(f.strip() for f in fuel.split(","))
+            station_dicts = [s for s in station_dicts if fuel_set & set(s["fuel_list"])]
+        if status:
+            status_set = set(s.strip() for s in status.split(","))
+            station_dicts = [s for s in station_dicts if s["status"] in status_set]
+        if brand:
+            bl = brand.strip().lower()
+            station_dicts = [s for s in station_dicts if bl in (s["brand"] or "").lower() or bl in (s["name"] or "").lower()]
+        return {"ids": [s["osm_id"] for s in station_dicts], "total": len(station_dicts)}
+
+    # ── GdeBenz ──
     try:
-        stations, _ = api.get_nearby(clat, clon, radius)
+        stations, _ = gdebenz_api.get_nearby(clat, clon, radius)
     except requests.exceptions.RequestException as e:
         raise _gdebenz_unavailable(e)
-
     fuel_types = [f.strip() for f in fuel.split(",")] if fuel else None
     statuses = [s.strip() for s in status.split(",")] if status else None
-
     filtered = filter_stations(stations, fuel_types=fuel_types, statuses=statuses, brand=brand)
     return {"ids": [s.osm_id for s in filtered], "total": len(filtered)}
-
-
-@app.post("/api/vote/preview", response_model=list[StationOut])
-def vote_preview(
-    city: str = Query(None),
-    lat: float = Query(None),
-    lon: float = Query(None),
-    radius: float = Query(20),
-    fuel: str = Query(None),
-    status: str = Query(None),
-    brand: str = Query(None),
-    limit: int = Query(200),
-):
-    """Preview which stations would be voted on."""
-    try:
-        clat, clon = resolve_coords(api, city=city, lat=lat, lon=lon)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    try:
-        stations, _ = api.get_nearby(clat, clon, radius)
-    except requests.exceptions.RequestException as e:
-        raise _gdebenz_unavailable(e)
-
-    fuel_types = [f.strip() for f in fuel.split(",")] if fuel else None
-    statuses = [s.strip() for s in status.split(",")] if status else None
-
-    filtered = filter_stations(stations, fuel_types=fuel_types, statuses=statuses, brand=brand)
-    if limit and limit < len(filtered):
-        filtered = filtered[:limit]
-
-    return [StationOut.from_station(s) for s in filtered]
 
 
 @app.post("/api/vote", response_model=list[VoteResult])
 def vote_bulk(req: VoteRequest):
     """Execute bulk vote."""
-    if req.vote_status not in STATUSES:
+    # benzin uses different statuses
+    valid_statuses = STATUSES  # gdebenz defaults
+    if req.source == "benzin":
+        valid_statuses = BENZIN_STATUSES
+
+    if req.vote_status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status: {req.vote_status}")
 
-    # Resolve voter coordinates
-    vlat, vlon = 0.0, 0.0
-    if req.city:
-        try:
-            vlat, vlon = resolve_coords(api, city=req.city)
-        except ValueError:
-            pass
-    if req.lat and req.lon:
-        vlat, vlon = req.lat, req.lon
-
-    # Resolve comment text: pick random from template if requested
+    # Resolve comment text
     text = req.text
     if text in ("__random_positive__", "__random_negative__"):
         category = "positive" if text == "__random_positive__" else "negative"
         templates = COMMENT_TEMPLATES.get(category, [])
         text = random.choice(templates) if templates else ""
 
+    if req.source == "benzin":
+        return _vote_benzin(req, text)
+
+    # ── GdeBenz ──
+    vlat, vlon = 0.0, 0.0
+    if req.city:
+        try:
+            vlat, vlon = resolve_coords(gdebenz_api, city=req.city)
+        except ValueError:
+            pass
+    if req.lat and req.lon:
+        vlat, vlon = req.lat, req.lon
+
     results = []
     for osm_id in req.osm_ids:
         try:
-            info = api.get_station_comments(osm_id)
+            info = gdebenz_api.get_station_comments(osm_id)
             name = info.get("addr", "") or osm_id
-
-            result = api.vote(
-                osm_id=osm_id,
-                status=req.vote_status,
-                name=name,
-                lat=0,
-                lon=0,
-                text=text,
-                vlat=vlat,
-                vlon=vlon,
-                on_site=req.on_site,
+            result = gdebenz_api.vote(
+                osm_id=osm_id, status=req.vote_status, name=name,
+                lat=0, lon=0, text=text, vlat=vlat, vlon=vlon, on_site=req.on_site,
             )
-            results.append(VoteResult(
-                osm_id=osm_id,
-                name=name,
-                success=result.get("success", False),
-                reason=result.get("reason", ""),
-            ))
+            results.append(VoteResult(osm_id=osm_id, name=name, success=result.get("success", False), reason=result.get("reason", "")))
         except Exception as e:
-            results.append(VoteResult(
-                osm_id=osm_id,
-                name="",
-                success=False,
-                reason=str(e),
-            ))
-
+            results.append(VoteResult(osm_id=osm_id, name="", success=False, reason=str(e)))
     return results
 
 
@@ -477,7 +594,7 @@ def vote_bulk(req: VoteRequest):
 def search_city(q: str = Query(...)):
     """Search for a city."""
     try:
-        cities = api.search_city(q)
+        cities = gdebenz_api.search_city(q)
         return {"results": cities}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -525,6 +642,8 @@ def delete_presence(clientId: str = Query(None)):
 STATIC_DIR = Path(__file__).parent / "static"
 AVATAR_SOURCE_DIR = Path(__file__).parent.parent / "avatars"
 AVATAR_STATIC_DIR = STATIC_DIR / "avatars"
+VIDEO_REELS_SOURCE_DIR = Path(__file__).parent.parent / "video-reels"
+VIDEO_REELS_STATIC_DIR = STATIC_DIR / "video-reels"
 
 
 @app.get("/")
@@ -555,9 +674,18 @@ if AVATAR_STATIC_DIR.exists():
 elif AVATAR_SOURCE_DIR.exists():
     app.mount("/avatars", StaticFiles(directory=str(AVATAR_SOURCE_DIR)), name="avatars")
 
+if VIDEO_REELS_STATIC_DIR.exists():
+    app.mount("/video-reels", StaticFiles(directory=str(VIDEO_REELS_STATIC_DIR)), name="video-reels")
+elif VIDEO_REELS_SOURCE_DIR.exists():
+    app.mount("/video-reels", StaticFiles(directory=str(VIDEO_REELS_SOURCE_DIR)), name="video-reels")
+
 
 def _status_color(s: str) -> str:
     return {"yes": "#30D56B", "queue": "#FF7A1A", "low": "#FFC400", "no": "#FF4D5A"}.get(s, "#8A94A6")
+
+
+def _benzin_status_color(s: str) -> str:
+    return {"available": "#30D56B", "limited": "#FFC400", "unavailable": "#FF4D5A", "queue": "#FF7A1A", "none": "#8A94A6"}.get(s, "#8A94A6")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 [build]
-  command = "npm test"
+  command = "npm test && npm run sync:video-reels"
   publish = "gdebenz_ui/static"
 
 [functions]

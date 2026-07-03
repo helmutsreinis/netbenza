@@ -10,6 +10,31 @@ const PRESENCE_HEARTBEAT_MS = 5000;
 const PRESENCE_POLL_MS = 4000;
 const PRESENCE_PUSH_MIN_MS = 1500;
 const ACTIVITY_IDLE_MS = 15000;
+const POTEMKIN_STANDBY_MESSAGE = 'Live station data is unavailable for a moment. Try again shortly.';
+const RESULT_MAP_PIN_COLOR = '#FF4D5A';
+const POTEMKIN_VIDEO_FILES = [
+  '17798970387630865084.mp4',
+  '7OZ3wCRuoxyton22.mp4',
+  'R0lZwrAFanF8A-uk.mp4',
+  'SnapVid.Net_14jw99baAbB25MUP_394p.mp4',
+  'SnapVid.Net_EiU09O70Et952VPD_270p.mp4',
+  'SnapVid.Net_ldH8N8KJfstXFVvb_568p.mp4',
+  'SnapVid.Net_olBU0Z8Uv0ds8rGo_568p.mp4',
+  'SnapVid.Net_T7g6os-tR-S0Bzwr_568p.mp4',
+  'SnapVid.Net_wZIdR1EEoo-f2FgI_568p.mp4',
+  'SnapVid.Net_y29hMZ6O4EUBvaPO_568p.mp4',
+  'ssstwitter.com_1732014702019.mp4',
+];
+const POTEMKIN_QUOTES = [
+  'No gasoline means every commute is now a wellness journey.',
+  'A fuel queue is just a loyalty program with fewer rewards.',
+  'Shortage? Please call it patriotic demand management.',
+  'The empty pump is a minimalist infrastructure statement.',
+  'Walking builds character. So does waiting five hours for 92.',
+  'Congratulations: national carbon targets achieved by accident.',
+  'Traffic is down because optimism cannot run on fumes.',
+  'Premium silence at every station, now included free.',
+];
 
 const FALLBACK_AVATAR_FILES = [
   '2024-08-22 16_34_08-Vatatastan on X_ _Visas bildes uzņemtas .png',
@@ -45,6 +70,9 @@ const state = {
   currentPage: 1,
   totalPages: 1,
   searchParams: null,    // last search params for cross-page ops
+  activeService: null,
+  resultsMap: null,
+  resultMarkers: [],
   city: null,
   fuel: new Set(),
   status: new Set(),
@@ -76,7 +104,11 @@ async function init() {
     toast('Config load error: ' + e.message);
   }
 
-  await loadAvatars();
+  // Add source to all future API calls
+  state.source = 'gdebenz';
+
+  // City dropdown → auto search
+  initServiceLauncher();
   initIdentityGate();
 
   // City dropdown → auto search
@@ -127,6 +159,7 @@ async function init() {
   $('#select-all-btn').addEventListener('click', selectAllPage);
   $('#deselect-all-btn').addEventListener('click', deselectAllPage);
   $('#vote-btn').addEventListener('click', doVote);
+  $('#vote-selected-btn').addEventListener('click', doVoteSelected);
   $('#vote-status').addEventListener('change', updateVoteBtn);
 
   // Pagination
@@ -169,6 +202,7 @@ function initIdentityGate() {
   if (state.identity) {
     $('#identity-modal').hidden = true;
     startPresence();
+    showServicePicker();
   } else {
     showIdentityModal();
   }
@@ -207,12 +241,77 @@ function saveIdentity(event) {
   $('#identity-modal').hidden = true;
   renderIdentityBadge();
   startPresence();
-  setActivity('online', '', true);
+  showServicePicker();
 }
 
 function showIdentityModal() {
   $('#identity-modal').hidden = false;
   setTimeout(() => $('#identity-handle').focus(), 0);
+}
+
+function initServiceLauncher() {
+  $$('[data-service]').forEach((button) => {
+    if (button.dataset.boundServiceLauncher === 'true') return;
+    button.dataset.boundServiceLauncher = 'true';
+    button.addEventListener('click', () => activateService(button.dataset.service));
+  });
+  const serviceSwitch = $('#service-switch');
+  if (serviceSwitch && serviceSwitch.dataset.boundServiceLauncher !== 'true') {
+    serviceSwitch.dataset.boundServiceLauncher = 'true';
+    serviceSwitch.addEventListener('click', showServicePicker);
+  }
+  updateServiceSwitch();
+}
+
+function showServicePicker() {
+  state.activeService = null;
+  const picker = $('#service-picker');
+  const gdebenz = $('#gdebenz-service');
+  if (picker) picker.hidden = false;
+  if (gdebenz) gdebenz.hidden = true;
+  document.body.classList.add('service-picker-open');
+  document.body.classList.remove('service-active-gdebenz');
+  updateServiceSwitch();
+  setActivity('selecting', 'Services', true);
+}
+
+function activateService(service) {
+  if (service !== 'gdebenz' && service !== 'benzin') {
+    toast('Service is not available yet');
+    return;
+  }
+
+  state.activeService = service;
+  state.source = service;
+  const picker = $('#service-picker');
+  const gdebenz = $('#gdebenz-service');
+  if (picker) picker.hidden = true;
+  if (gdebenz) gdebenz.hidden = false;
+  document.body.classList.remove('service-picker-open');
+  document.body.classList.add('service-active-gdebenz');
+  updateServiceSwitch();
+
+  // Re-fetch config for the selected source and rebuild filters
+  loadConfigForSource(service);
+  setActivity('online', service === 'benzin' ? 'Benzin-Status' : 'GdeBenz', true);
+}
+
+function updateServiceSwitch() {
+  const serviceSwitch = $('#service-switch');
+  if (!serviceSwitch) return;
+  serviceSwitch.hidden = !state.identity;
+}
+
+async function loadConfigForSource(source) {
+  try {
+    state.config = await api(`/api/config?source=${source}`);
+    renderFuelChips();
+    renderStatusChips();
+    renderVoteStatusOptions();
+    renderBrandSelect();
+  } catch (e) {
+    toast('Config load error: ' + e.message);
+  }
 }
 
 function renderAvatarGrid() {
@@ -460,7 +559,7 @@ function buildSearchParams() {
   const city = $('#city-input').value.trim();
   const lat = $('#lat-input').value;
   const lon = $('#lon-input').value;
-  const radius = $('#radius-input').value || '20';
+  const radius = $('#radius-input').value || '7';
   const brand = $('#brand-filter').value;
   if (city) p.set('city', city);
   if (lat) p.set('lat', lat);
@@ -469,6 +568,7 @@ function buildSearchParams() {
   if (state.fuel.size) p.set('fuel', [...state.fuel].join(','));
   if (state.status.size) p.set('status', [...state.status].join(','));
   if (brand) p.set('brand', brand);
+  p.set('source', state.source || 'gdebenz');
   return p;
 }
 
@@ -514,9 +614,103 @@ async function loadPage(offset) {
     $('#station-list').scrollIntoView({ behavior: 'smooth', block: 'start' });
     setActivity('online', `${state.totalFiltered} stations`, true);
   } catch (e) {
-    list.innerHTML = `<div class="empty-state"><div class="icon">⚠️</div>${e.message}</div>`;
+    renderSearchFailure(e);
     setActivity('idle', '', true);
   }
+}
+
+function renderSearchFailure(error) {
+  const list = $('#station-list');
+  $('#stats-bar').style.display = 'none';
+  $('#pagination').style.display = 'none';
+  $('#pagination-bot').style.display = 'none';
+  $('#vote-panel').style.display = 'none';
+  $('#results-area').innerHTML = '';
+
+  if (!isGdeBenzOutageError(error)) {
+    list.innerHTML = `<div class="empty-state"><div class="icon">⚠️</div>${esc(error.message || String(error))}</div>`;
+    return;
+  }
+
+  const quotes = POTEMKIN_QUOTES.map((quote, index) => `
+    <span
+      class="potemkin-quote"
+      style="--quote-top:${10 + (index % 5) * 16}%; --quote-delay:${index * -2.3}s; --quote-duration:${22 + (index % 4) * 5}s">
+      ${esc(quote)}
+    </span>
+  `).join('');
+
+  list.innerHTML = `
+    <section class="potemkin-standby" aria-live="polite">
+      <div class="potemkin-quotes" aria-hidden="true">${quotes}</div>
+      <div class="potemkin-copy">
+        <p class="potemkin-kicker">GdeBenz signal lost</p>
+        <h2>Please stand by and enjoy some Potemkin nostalgia</h2>
+        <p class="potemkin-message">${POTEMKIN_STANDBY_MESSAGE}</p>
+      </div>
+      <div class="potemkin-player" aria-label="Potemkin nostalgia video reels">
+        <article class="potemkin-video-shell">
+          <video
+            id="potemkin-video"
+            class="potemkin-video"
+            autoplay
+            controls
+            muted
+            playsinline
+            preload="metadata"
+            src="${potemkinVideoSrc(0)}"
+            data-video-index="0"></video>
+          <div class="potemkin-video-meta">
+            <span>Sequential nostalgia broadcast</span>
+            <span class="potemkin-video-count">1 / ${POTEMKIN_VIDEO_FILES.length}</span>
+          </div>
+        </article>
+      </div>
+    </section>
+  `;
+  wirePotemkinVideoPlayer(list);
+}
+
+function isGdeBenzOutageError(error) {
+  const message = String(error?.message || error || '');
+  return /Could not reach GdeBenz|fetch failed|Failed to fetch|NetworkError/i.test(message);
+}
+
+function wirePotemkinVideoPlayer(root) {
+  const video = $('#potemkin-video', root);
+  if (!video) return;
+  video.controls = true;
+  video.muted = true;
+  try {
+    video.volume = 0.1;
+  } catch {
+    // Some test/browser environments can reject volume assignment.
+  }
+  if (POTEMKIN_VIDEO_FILES.length < 2) return;
+  video.addEventListener('ended', () => advancePotemkinVideo(video, root));
+}
+
+function advancePotemkinVideo(video, root) {
+  const currentIndex = Number(video.dataset.videoIndex || 0);
+  const nextIndex = ((Number.isFinite(currentIndex) ? currentIndex : 0) + 1) % POTEMKIN_VIDEO_FILES.length;
+  video.dataset.videoIndex = String(nextIndex);
+  video.setAttribute('src', potemkinVideoSrc(nextIndex));
+
+  const count = $('.potemkin-video-count', root);
+  if (count) count.textContent = `${nextIndex + 1} / ${POTEMKIN_VIDEO_FILES.length}`;
+
+  if (window.navigator?.userAgent?.includes('jsdom')) return;
+
+  try {
+    const playback = video.play?.();
+    if (playback && typeof playback.catch === 'function') playback.catch(() => {});
+  } catch {
+    // Browsers may block autoplay after source changes; the next user-visible frame still advances.
+  }
+}
+
+function potemkinVideoSrc(index) {
+  return `/video-reels/${encodeURIComponent(POTEMKIN_VIDEO_FILES[index] || POTEMKIN_VIDEO_FILES[0])}`;
 }
 
 function goPage(page) {
@@ -530,6 +724,7 @@ function renderStations(data) {
   const list = $('#station-list');
   if (!data.stations.length) {
     list.innerHTML = '<div class="empty-state"><div class="icon">📭</div>No stations found</div>';
+    renderResultsMap([]);
     $('#stats-bar').style.display = 'none';
     $('#pagination').style.display = 'none';
     $('#pagination-bot').style.display = 'none';
@@ -573,7 +768,120 @@ function renderStations(data) {
   updateSelectedCount();
   $('#stats-bar').style.display = 'flex';
   $('#vote-panel').style.display = '';
+  renderResultsMap(data.stations);
   updateVoteBtn();
+}
+
+function renderResultsMap(stations) {
+  const panel = $('#results-map-panel');
+  const mapEl = $('#current-page-map');
+  const countEl = $('#results-map-count');
+  if (!panel || !mapEl) return;
+
+  const plottedStations = stations.filter(hasStationCoords);
+  panel.hidden = stations.length === 0;
+  if (countEl) {
+    const count = plottedStations.length;
+    countEl.textContent = `${count} ${count === 1 ? 'station' : 'stations'}`;
+  }
+
+  clearResultMarkers();
+
+  if (!stations.length) {
+    return;
+  }
+
+  if (!plottedStations.length) {
+    destroyResultsMap();
+    mapEl.innerHTML = '<div class="map-fallback"><div><strong>No coordinates</strong><span>Current page stations have no map positions.</span></div></div>';
+    return;
+  }
+
+  if (!window.L) {
+    destroyResultsMap();
+    mapEl.innerHTML = '<div class="map-fallback"><div><strong>Map unavailable</strong><span>OpenStreetMap could not load, but the station list is ready.</span></div></div>';
+    return;
+  }
+
+  if (!state.resultsMap) mapEl.innerHTML = '';
+  const map = ensureResultsMap(mapEl, plottedStations[0]);
+  if (!map) return;
+
+  state.resultMarkers = plottedStations.map(station => {
+    const marker = window.L.marker([station.lat, station.lon], {
+      icon: window.L.divIcon({
+        className: '',
+        html: `<span class="result-map-marker" style="background:${RESULT_MAP_PIN_COLOR}"></span>`,
+        iconSize: [18, 18],
+        iconAnchor: [9, 9],
+      }),
+      title: station.name || station.brand || 'Gas Station',
+    }).addTo(map);
+
+    marker.bindPopup(`
+      <div class="result-map-popup">
+        <strong>${esc(station.name || station.brand || 'Gas Station')}</strong>
+        <span>${esc(station.addr || station.status_label || '')}</span>
+      </div>
+    `);
+    marker.on('click', () => focusStationCard(station.osm_id));
+    return marker;
+  });
+
+  const bounds = window.L.latLngBounds(plottedStations.map(station => [station.lat, station.lon]));
+  setTimeout(() => {
+    map.invalidateSize();
+    if (plottedStations.length === 1) {
+      map.setView(bounds.getCenter(), 14);
+    } else {
+      map.fitBounds(bounds, { padding: [22, 22], maxZoom: 15 });
+    }
+  }, 0);
+}
+
+function ensureResultsMap(mapEl, firstStation) {
+  if (state.resultsMap) return state.resultsMap;
+  state.resultsMap = window.L.map(mapEl, {
+    attributionControl: true,
+    scrollWheelZoom: false,
+  }).setView([firstStation.lat, firstStation.lon], 12);
+
+  window.L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap contributors',
+  }).addTo(state.resultsMap);
+
+  return state.resultsMap;
+}
+
+function clearResultMarkers() {
+  if (!state.resultsMap || !state.resultMarkers.length) {
+    state.resultMarkers = [];
+    return;
+  }
+  state.resultMarkers.forEach(marker => marker.remove());
+  state.resultMarkers = [];
+}
+
+function destroyResultsMap() {
+  clearResultMarkers();
+  if (!state.resultsMap) return;
+  state.resultsMap.remove();
+  state.resultsMap = null;
+}
+
+function hasStationCoords(station) {
+  return station.lat !== null && station.lat !== undefined && station.lat !== '' &&
+    station.lon !== null && station.lon !== undefined && station.lon !== '' &&
+    Number.isFinite(Number(station.lat)) && Number.isFinite(Number(station.lon));
+}
+
+function focusStationCard(osmId) {
+  const card = $$('.station-card').find(el => el.dataset.osm === String(osmId));
+  if (!card) return;
+  $$('.station-card.map-focused').forEach(el => el.classList.remove('map-focused'));
+  card.classList.add('map-focused');
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 function renderPagination() {
@@ -629,16 +937,20 @@ function deselectAllPage() {
 }
 
 function updateSelectedCount() {
-  $('#stats-selected').textContent = `Selected: ${state.allSelected.size} (total across all pages)`;
-  const voteCount = $('#vote-count');
-  if (voteCount) voteCount.textContent = state.allSelected.size;
+  const statsEl = $('#stats-selected');
+  if (statsEl) statsEl.textContent = `Selected: ${state.allSelected.size} (total across all pages)`;
+  const selCnt = $('#vote-sel-count');
+  if (selCnt) selCnt.textContent = state.allSelected.size;
+  const allCnt = $('#vote-all-count');
+  if (allCnt) allCnt.textContent = state.totalFiltered;
 }
+
 function updateVoteBtn() {
-  const btn = $('#vote-btn');
-  btn.disabled = !$('#vote-status').value || state.totalFiltered === 0;
-  btn.innerHTML = state.totalFiltered
-    ? `🗳 Vote ALL (<span id="vote-count">${state.allSelected.size}</span> / ${state.totalFiltered} filtered)`
-    : `🗳 Vote ALL (<span id="vote-count">${state.allSelected.size}</span>)`;
+  const hasStatus = !!$('#vote-status')?.value;
+  const voteBtn = $('#vote-btn');
+  if (voteBtn) voteBtn.disabled = !hasStatus || state.totalFiltered === 0;
+  const selBtn = $('#vote-selected-btn');
+  if (selBtn) selBtn.disabled = !hasStatus || state.allSelected.size === 0;
 }
 
 // ── Voting (ALL filtered stations across all pages) ──
@@ -730,6 +1042,7 @@ async function doVote() {
           text: baseText,
           on_site: $('#vote-onsite').checked,
           city: city, lat: lat, lon: lon,
+          source: state.source || 'gdebenz',
           fingerprint: state.identity?.fingerprint || state.identity?.clientId || '',
         }),
       });
@@ -752,6 +1065,98 @@ async function doVote() {
   btn.disabled = false;
   $('#vote-status').value = '';
   updateVoteBtn();
+  setActivity('done', `${ok} OK · ${fail} failed`, true);
+  setTimeout(() => { progBar.style.display = 'none'; }, 10000);
+  if (fail || skip) renderResults(results);
+  else toast(`✅ All ${ok} votes sent!`);
+}
+
+// ── Voting (selected stations only) ─────────────────
+async function doVoteSelected() {
+  const voteStatus = $('#vote-status').value;
+  if (!voteStatus || state.allSelected.size === 0) return;
+
+  const ids = [...state.allSelected];
+  const total = ids.length;
+  const btn = $('#vote-selected-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Voting...';
+
+  const mode = $('#comment-mode').value;
+  const lat = parseFloat($('#lat-input').value) || null;
+  const lon = parseFloat($('#lon-input').value) || null;
+  const city = $('#city-input').value.trim() || null;
+
+  // Progress bar
+  const progBar = $('#progress-bar');
+  const progFill = $('#progress-fill');
+  const progText = $('#progress-text');
+  const progPct = $('#progress-pct');
+  const progCur = $('#progress-current');
+  const progBadge = $('#progress-badge');
+  progBar.style.display = '';
+  progFill.style.width = '0%';
+  progFill.classList.remove('done');
+  $('#results-area').innerHTML = '';
+
+  let baseText = '';
+  if (mode === 'positive') baseText = '__random_positive__';
+  else if (mode === 'negative') baseText = '__random_negative__';
+  else baseText = $('#vote-text').value;
+
+  const results = [];
+  let ok = 0, fail = 0, skip = 0;
+  const startTime = Date.now();
+
+  for (let i = 0; i < total; i++) {
+    const osmId = ids[i];
+    const pct = Math.round((i / total) * 100);
+    progFill.style.width = pct + '%';
+    progText.textContent = `Voted ${i} / ${total}`;
+    progBadge.textContent = `#${i + 1} of ${total}`;
+    if (i > 0) {
+      const elapsed = (Date.now() - startTime) / 1000;
+      const remaining = Math.ceil((total - i) / (i / elapsed));
+      progPct.textContent = pct + `% — ~${remaining}s left`;
+    } else {
+      progPct.textContent = '0%';
+    }
+    progCur.textContent = `Station ${osmId}`;
+
+    try {
+      const resp = await api('/api/vote', {
+        method: 'POST',
+        body: JSON.stringify({
+          osm_ids: [osmId], vote_status: voteStatus, text: baseText,
+          on_site: $('#vote-onsite').checked, city, lat, lon,
+          source: state.source || 'gdebenz',
+          fingerprint: state.identity?.fingerprint || state.identity?.clientId || '',
+        }),
+      });
+      const r = resp[0] || { osm_id: osmId, name: osmId, success: false, reason: 'no response' };
+      r.success ? ok++ : (r.reason === 'already voted' ? skip++ : fail++);
+      results.push(r);
+    } catch (e) {
+      fail++;
+      results.push({ osm_id: osmId, name: osmId, success: false, reason: e.message });
+    }
+  }
+
+  // Done
+  progFill.style.width = '100%';
+  progFill.classList.add('done');
+  progText.textContent = `✅ ${ok} OK · ⏭ ${skip} skipped · ❌ ${fail} failed`;
+  progPct.textContent = '100%';
+  progBadge.textContent = 'COMPLETE';
+  progCur.textContent = '';
+  btn.textContent = `🗳 Vote Selected (${total})`;
+  btn.disabled = false;
+  state.allSelected.clear();
+  state.selected.clear();
+  $$('.station-card').forEach(c => c.classList.remove('selected'));
+  updateSelectedCount();
+  updateVoteBtn();
+  $('#vote-status').value = '';
   setActivity('done', `${ok} OK · ${fail} failed`, true);
   setTimeout(() => { progBar.style.display = 'none'; }, 10000);
   if (fail || skip) renderResults(results);
