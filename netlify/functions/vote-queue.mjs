@@ -19,6 +19,17 @@ function currentNow(options, nowFn) {
   return nowFn();
 }
 
+function safeRouteErrorDetail(error) {
+  const detail = String(error?.code || error?.message || 'vote_queue_failed');
+  return /^[a-zA-Z0-9_.:-]{1,120}$/.test(detail) ? detail : 'vote_queue_failed';
+}
+
+function queueRouteErrorResponse(error) {
+  const status = Number(error?.status);
+  const responseStatus = Number.isInteger(status) && status >= 400 ? status : 503;
+  return errorResponse(responseStatus, safeRouteErrorDetail(error));
+}
+
 export async function handleVoteQueueRequest(req, options = {}) {
   if (req.method !== 'GET') return methodNotAllowed(['GET']);
 
@@ -31,8 +42,12 @@ export async function handleVoteQueueRequest(req, options = {}) {
   }
 
   const queueStore = options.queueStore || getVoteQueueStore();
-  const state = await readQueueState(queueStore, now);
-  return jsonResponse(publicQueueSnapshot(state, now));
+  try {
+    const state = await readQueueState(queueStore, now);
+    return jsonResponse(publicQueueSnapshot(state, now));
+  } catch (error) {
+    return queueRouteErrorResponse(error);
+  }
 }
 
 export default async function handler(req) {

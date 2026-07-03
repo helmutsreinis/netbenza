@@ -89,6 +89,12 @@ class FailingWriteStore extends MemoryPresenceStore {
   }
 }
 
+class FailingReadStore extends MemoryPresenceStore {
+  async get() {
+    throw new Error('blob_read_failed');
+  }
+}
+
 describe('Netlify vote queue routes', () => {
   it('routes an active Benzin station vote through the queue and exposes an empty public snapshot', async () => {
     let now = 1_000_000;
@@ -461,6 +467,71 @@ describe('Netlify vote queue routes', () => {
         reason: 'Could not reach Benzin-Status. Please try again in a moment. (upstream_fetch_failed)',
       }]);
       assert.deepEqual(state.entries, []);
+    });
+  });
+
+  it('returns a route-level error when the public queue snapshot cannot read state', async () => {
+    const now = 2_800_000;
+    const access = await accessContext({ now, ip: '198.51.100.63' });
+    const response = await handleVoteQueueRequest(new Request('http://localhost/api/vote/queue', {
+      method: 'GET',
+      headers: access.headers,
+    }), {
+      accessStore: access.store,
+      queueStore: new FailingReadStore(),
+      nowFn: () => now,
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.detail, 'blob_read_failed');
+  });
+
+  it('returns a route-level error and skips upstream when the vote route cannot read queue state', async () => {
+    const now = 2_900_000;
+    const access = await accessContext({ now, ip: '198.51.100.64' });
+    const presenceStore = new MemoryPresenceStore();
+    const queueStore = new FailingReadStore();
+    let upstreamCalls = 0;
+
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+    });
+
+    await withMockFetch(async () => {
+      upstreamCalls += 1;
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }, async () => {
+      const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
+        method: 'POST',
+        headers: { ...access.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          source: 'benzin',
+          osm_ids: ['123'],
+          vote_status: 'available',
+          clientId: 'client-one',
+          sessionId: 'session-one',
+        }),
+      }), {
+        accessStore: access.store,
+        presenceStore,
+        queueStore,
+        nowFn: () => now,
+        sleep: async () => {},
+        maxWaitMs: 5_000,
+      });
+      const body = await response.json();
+
+      assert.equal(response.status, 503);
+      assert.equal(body.detail, 'blob_read_failed');
+      assert.equal(upstreamCalls, 0);
     });
   });
 

@@ -54,6 +54,12 @@ function vote(overrides = {}) {
   };
 }
 
+class FailingReadStore extends MemoryPresenceStore {
+  async get() {
+    throw new Error('blob_read_failed');
+  }
+}
+
 describe('vote queue store', () => {
   it('exposes only public queue fields', () => {
     const entry = createVoteQueueEntry({
@@ -96,6 +102,18 @@ describe('vote queue store', () => {
     assert.equal(serialized.includes('private-fingerprint'), false);
     assert.equal(serialized.includes('55.7'), false);
     assert.equal(serialized.includes('37.6'), false);
+  });
+
+  it('returns default state only for missing queue state and rejects read failures', async () => {
+    const emptyStore = new MemoryPresenceStore();
+
+    assert.deepEqual(await readQueueState(emptyStore, 1000), {
+      entries: [],
+      lastSubmissionAt: 0,
+      lastClientId: '',
+      processingId: '',
+    });
+    await assert.rejects(() => readQueueState(new FailingReadStore(), 1000), /blob_read_failed/);
   });
 
   it('allows one active queued or processing vote per clientId and per ipKey', async () => {

@@ -150,7 +150,7 @@ async function writeQueueState(store, state) {
 }
 
 export async function readQueueState(store = getVoteQueueStore(), now = Date.now()) {
-  const state = await store.get(QUEUE_STATE_KEY, { type: 'json' }).catch(() => null);
+  const state = await store.get(QUEUE_STATE_KEY, { type: 'json' });
   if (!state) return defaultQueueState();
   const normalized = normalizeState(state);
   const cleaned = cleanupStaleProcessing(normalized, now);
