@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a strict one-session-per-`clientId`, one-profile-per-IP collaboration layer with public fair vote queueing, a 2 second global vote rate limit, and compact connected-user chat.
+**Goal:** Build a Latvian + Ukrainian access questionnaire followed by strict one-session-per-`clientId`, one-profile-per-IP collaboration with public fair vote queueing, a 2 second global vote rate limit, and compact connected-user chat.
 
-**Architecture:** Extend the existing Netlify Blob-backed presence system with `sessionId` and server-derived `ipKey` validation. Add focused stores for vote queueing and chat, then wire the existing `/api/vote` route through the queue. The frontend keeps the current sequential vote loop, but shuffles bulk ids, includes active identity/session metadata, polls public queue/chat snapshots, and blocks replaced sessions.
+**Architecture:** Add a server-backed pre-profile questionnaire gate that mints a session access token before avatar setup. Extend the existing Netlify Blob-backed presence system with `sessionId` and server-derived `ipKey` validation. Add focused stores for vote queueing and chat, then wire the existing `/api/vote` route through the queue. The frontend keeps the current sequential vote loop, but shuffles bulk ids, includes active identity/session metadata, polls public queue/chat snapshots, and blocks replaced sessions.
 
 **Tech Stack:** Vanilla HTML/CSS/JS, Netlify Functions in ESM JavaScript, Netlify Blobs, Node built-in test runner, jsdom.
 
@@ -12,20 +12,933 @@
 
 ## File Structure
 
+- Create `netlify/functions/lib/access-gate-store.mjs`: own the Latvian + Ukrainian question bank, generate challenges, validate answers, issue token records, and assert token validity against `ipKey` and `accessSessionId`.
+- Create `netlify/functions/lib/request-context.mjs`: normalize request IPs into private `ipKey` values shared by access tokens, presence, queue, and chat.
+- Create `netlify/functions/access-token.mjs`: expose `GET /api/access-token` for a public challenge and `POST /api/access-token` for server-side answer validation plus token issuance.
+- Create `tests/access-gate.test.mjs`: cover challenge privacy, token issuance, wrong-answer retry behavior, and token validation failures.
+- Modify existing Netlify function entrypoints `config.mjs`, `stations.mjs`, `station-ids.mjs`, `vote-preview.mjs`, `city-search.mjs`, `avatars.mjs`, `presence.mjs`, and `vote.mjs`: reject requests without a valid access token after Task 0.
 - Modify `netlify/functions/lib/presence-store.mjs`: add `sessionId`, `ipKey`, request IP normalization, stale-session detection, per-IP profile replacement, and active-session assertions.
 - Create `netlify/functions/lib/vote-queue-store.mjs`: manage public/private queue entries, one active entry per `clientId`/`ipKey`, round-robin selection, and 2 second scheduling.
 - Create `netlify/functions/vote-queue.mjs`: expose `GET /api/vote/queue` for public queue snapshots.
 - Modify `netlify/functions/vote.mjs`: export an injectable `handleVoteRequest` and run each vote through `vote-queue-store`.
 - Create `netlify/functions/lib/chat-store.mjs`: normalize and persist rolling chat messages with active-session validation.
 - Create `netlify/functions/chat.mjs`: expose `GET/POST /api/chat`.
-- Modify `gdebenz_ui/static/index.html`: add replaced-session modal, queue panel, and chat panel.
-- Modify `gdebenz_ui/static/style.css`: style compact queue/chat/session states and keep header roster from overflowing.
-- Modify `gdebenz_ui/static/app.js`: generate per-load `sessionId`, include session metadata in presence/vote/chat, shuffle vote ids, poll queue/chat, render queue/chat, and block stale sessions.
+- Modify `gdebenz_ui/static/index.html`: add the initial questionnaire modal, replaced-session modal, queue panel, and chat panel.
+- Modify `gdebenz_ui/static/style.css`: style the Latvian + Ukrainian questionnaire, compact queue/chat/session states, and keep header roster from overflowing.
+- Modify `gdebenz_ui/static/app.js`: add the question bank and access gate, generate per-load `sessionId`, include session metadata in presence/vote/chat, shuffle vote ids, poll queue/chat, render queue/chat, and block stale sessions.
 - Modify `tests/presence.test.mjs`: cover session/IP replacement and public snapshot privacy.
 - Create `tests/vote-queue.test.mjs`: cover queue public fields, per-user/per-IP bounds, fair selection, and rate timing.
 - Create `tests/netlify-vote-queue-route.test.mjs`: cover `/api/vote` queue integration and stale-session rejection.
 - Create `tests/chat.test.mjs`: cover chat normalization, rolling history, and stale-session rejection.
-- Modify `tests/frontend-dom.test.mjs`: cover queue/chat rendering, shuffled vote ids, session metadata, and replaced-session blocking.
+- Modify `tests/frontend-dom.test.mjs`: cover questionnaire rendering/retry/session token persistence, queue/chat rendering, shuffled vote ids, session metadata, and replaced-session blocking.
+
+---
+
+### Task 0: Initial Latvian + Ukrainian Access Token Gate
+
+**Files:**
+- Create: `netlify/functions/lib/request-context.mjs`
+- Create: `netlify/functions/lib/access-gate-store.mjs`
+- Create: `netlify/functions/access-token.mjs`
+- Create: `tests/access-gate.test.mjs`
+- Modify: `netlify/functions/config.mjs`
+- Modify: `netlify/functions/stations.mjs`
+- Modify: `netlify/functions/station-ids.mjs`
+- Modify: `netlify/functions/vote-preview.mjs`
+- Modify: `netlify/functions/city-search.mjs`
+- Modify: `netlify/functions/avatars.mjs`
+- Modify: `netlify/functions/presence.mjs`
+- Modify: `netlify/functions/vote.mjs`
+- Modify: `gdebenz_ui/static/index.html`
+- Modify: `gdebenz_ui/static/style.css`
+- Modify: `gdebenz_ui/static/app.js`
+- Modify: `tests/frontend-dom.test.mjs`
+
+- [ ] **Step 1: Write failing access gate backend tests**
+
+Create `tests/access-gate.test.mjs`:
+
+```javascript
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+
+import {
+  MemoryAccessGateStore,
+  ACCESS_TOKEN_TTL_MS,
+  assertAccessToken,
+  createAccessChallenge,
+  issueAccessToken,
+  publicChallenge,
+  validateAccessAnswers,
+} from '../netlify/functions/lib/access-gate-store.mjs';
+import { handleAccessTokenRequest } from '../netlify/functions/access-token.mjs';
+
+function request(path = '/api/access-token', options = {}) {
+  return new Request(`https://site.test${path}`, {
+    headers: { 'x-forwarded-for': '203.0.113.80', ...(options.headers || {}) },
+    ...options,
+  });
+}
+
+describe('access gate', () => {
+  it('creates a public three-question challenge without correct answers', async () => {
+    const store = new MemoryAccessGateStore();
+    const challenge = await createAccessChallenge(store, {
+      now: 1_000,
+      id: 'challenge-one',
+      rng: () => 0,
+    });
+    const publicView = publicChallenge(challenge);
+
+    assert.equal(publicView.challengeId, 'challenge-one');
+    assert.equal(publicView.questions.length, 3);
+    assert.equal(new Set(publicView.questions.map((question) => question.id)).size, 3);
+    assert.equal(Object.hasOwn(publicView.questions[0], 'correct'), false);
+    assert.deepEqual(publicView.questions[0].answers.map((answer) => answer.value), [false, true]);
+  });
+
+  it('validates all three submitted answers before issuing a token', async () => {
+    const store = new MemoryAccessGateStore();
+    const challenge = await createAccessChallenge(store, {
+      now: 2_000,
+      id: 'challenge-two',
+      rng: () => 0,
+    });
+    const correctAnswers = Object.fromEntries(
+      challenge.questions.map((question) => [question.id, question.correct]),
+    );
+    const wrongAnswers = { ...correctAnswers, [challenge.questions[0].id]: !challenge.questions[0].correct };
+
+    assert.equal(validateAccessAnswers(challenge, correctAnswers), true);
+    assert.equal(validateAccessAnswers(challenge, wrongAnswers), false);
+
+    await assert.rejects(() => issueAccessToken(store, {
+      challengeId: challenge.id,
+      answers: wrongAnswers,
+      accessSessionId: 'session-a',
+      ipKey: 'ip:203.0.113.80',
+      now: 2_500,
+      token: 'wrong-token',
+    }), /access_answers_incorrect/);
+
+    const issued = await issueAccessToken(store, {
+      challengeId: challenge.id,
+      answers: correctAnswers,
+      accessSessionId: 'session-a',
+      ipKey: 'ip:203.0.113.80',
+      now: 3_000,
+      token: 'good-token',
+    });
+
+    assert.equal(issued.accessToken, 'good-token');
+    assert.equal(issued.expiresAt, 3_000 + ACCESS_TOKEN_TTL_MS);
+  });
+
+  it('rejects missing, mismatched, and expired access tokens', async () => {
+    const store = new MemoryAccessGateStore();
+    await store.setJSON('tokens/good-token', {
+      token: 'good-token',
+      accessSessionId: 'session-a',
+      ipKey: 'ip:203.0.113.80',
+      issuedAt: 10_000,
+      expiresAt: 10_000 + ACCESS_TOKEN_TTL_MS,
+    });
+
+    await assert.rejects(() => assertAccessToken(store, {
+      accessToken: '',
+      accessSessionId: 'session-a',
+      ipKey: 'ip:203.0.113.80',
+      now: 11_000,
+    }), /access_token_required/);
+
+    await assert.rejects(() => assertAccessToken(store, {
+      accessToken: 'good-token',
+      accessSessionId: 'other-session',
+      ipKey: 'ip:203.0.113.80',
+      now: 11_000,
+    }), /access_session_mismatch/);
+
+    await assert.rejects(() => assertAccessToken(store, {
+      accessToken: 'good-token',
+      accessSessionId: 'session-a',
+      ipKey: 'ip:198.51.100.10',
+      now: 11_000,
+    }), /access_ip_mismatch/);
+
+    await assert.rejects(() => assertAccessToken(store, {
+      accessToken: 'good-token',
+      accessSessionId: 'session-a',
+      ipKey: 'ip:203.0.113.80',
+      now: 10_000 + ACCESS_TOKEN_TTL_MS + 1,
+    }), /access_token_expired/);
+  });
+
+  it('serves challenges and tokens through the access-token route', async () => {
+    const store = new MemoryAccessGateStore();
+
+    const challengeResponse = await handleAccessTokenRequest(request('/api/access-token', {
+      method: 'GET',
+    }), {
+      store,
+      nowFn: () => 20_000,
+      rng: () => 0,
+      idFn: () => 'challenge-route',
+      tokenFn: () => 'route-token',
+    });
+    const challengeJson = await challengeResponse.json();
+    const challenge = await store.get('challenges/challenge-route', { type: 'json' });
+    const answers = Object.fromEntries(challenge.questions.map((question) => [question.id, question.correct]));
+
+    const tokenResponse = await handleAccessTokenRequest(request('/api/access-token', {
+      method: 'POST',
+      body: JSON.stringify({
+        challengeId: challengeJson.challengeId,
+        answers,
+        accessSessionId: 'browser-session',
+      }),
+    }), {
+      store,
+      nowFn: () => 21_000,
+      rng: () => 0,
+      idFn: () => 'unused',
+      tokenFn: () => 'route-token',
+    });
+    const tokenJson = await tokenResponse.json();
+
+    assert.equal(challengeResponse.status, 200);
+    assert.equal(tokenResponse.status, 200);
+    assert.equal(tokenJson.accessToken, 'route-token');
+  });
+});
+```
+
+- [ ] **Step 2: Run backend access tests and verify RED**
+
+Run:
+
+```bash
+npm test -- tests/access-gate.test.mjs
+```
+
+Expected: FAIL because the access gate store and route do not exist yet.
+
+- [ ] **Step 3: Implement shared request IP normalization**
+
+Create `netlify/functions/lib/request-context.mjs`:
+
+```javascript
+export function requestIpKey(req) {
+  const headers = req?.headers;
+  const raw = headers?.get('x-nf-client-connection-ip')
+    || headers?.get('client-ip')
+    || headers?.get('cf-connecting-ip')
+    || headers?.get('x-real-ip')
+    || headers?.get('x-forwarded-for')
+    || 'local';
+  const first = String(raw).split(',')[0].trim().toLowerCase();
+  const safe = first.replace(/[^a-z0-9:._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return `ip:${safe || 'local'}`;
+}
+```
+
+- [ ] **Step 4: Implement the access gate store**
+
+Create `netlify/functions/lib/access-gate-store.mjs`:
+
+```javascript
+import { getStore } from '@netlify/blobs';
+import { requestIpKey } from './request-context.mjs';
+
+export const ACCESS_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
+export const ACCESS_CHALLENGE_TTL_MS = 10 * 60 * 1000;
+
+export const ACCESS_QUESTION_BANK = [
+  { id: 'crimea-ukraine', prompt: 'Is Crimea part of Ukraine?', correct: true },
+  { id: 'ukraine-black-sea', prompt: 'Does Ukraine border the Black Sea?', correct: true },
+  { id: 'ukraine-largest-europe', prompt: 'Is Ukraine the largest country entirely within Europe by area?', correct: true },
+  { id: 'dnipro-longest', prompt: 'Is the Dnipro the longest river that flows through Ukraine?', correct: true },
+  { id: 'ukraine-slovakia', prompt: 'Does Ukraine share a border with Slovakia?', correct: true },
+  { id: 'hoverla-highest', prompt: 'Is Mount Hoverla the highest peak in Ukraine?', correct: true },
+  { id: 'ukraine-baltic-sea', prompt: 'Does Ukraine border the Baltic Sea?', correct: false },
+  { id: 'odesa-port', prompt: 'Is Odesa a major Ukrainian port city on the Black Sea?', correct: true },
+  { id: 'carpathians-ukraine', prompt: 'Are the Carpathian Mountains partly located in Ukraine?', correct: true },
+  { id: 'azov-crimea', prompt: 'Is the Sea of Azov located to the northeast of Crimea?', correct: true },
+  { id: 'putin-dictator', prompt: 'Is Vladimir Putin a dictator?', correct: true },
+  { id: 'full-scale-invasion', prompt: 'Did Russia launch a full-scale invasion of Ukraine on February 24, 2022?', correct: true },
+  { id: 'zelenskyy-president', prompt: 'Is Volodymyr Zelenskyy the President of Ukraine?', correct: true },
+  { id: 'crimea-annexed-2014', prompt: 'Did Russia annex Crimea in 2014?', correct: true },
+  { id: 'ukraine-eu-application', prompt: 'Did Ukraine apply for EU membership after the 2022 invasion?', correct: true },
+  { id: 'z-propaganda', prompt: 'Is the "Z" symbol associated with Russian pro-war propaganda?', correct: true },
+  { id: 'borscht', prompt: 'Is borscht a traditional Ukrainian dish?', correct: true },
+  { id: 'ukrainian-cyrillic', prompt: 'Is the Ukrainian language written in the Cyrillic alphabet?', correct: true },
+  { id: 'vyshyvanka', prompt: 'Are vyshyvanka traditional Ukrainian embroidered shirts?', correct: true },
+  { id: 'shevchenko', prompt: "Is Taras Shevchenko considered Ukraine's national poet?", correct: true },
+  { id: 'sunflower-oil', prompt: "Is Ukraine one of the world's largest exporters of sunflower oil?", correct: true },
+  { id: 'breadbasket', prompt: 'Was Ukraine known as the "breadbasket of Europe" due to its fertile black soil?', correct: true },
+  { id: 'mriya', prompt: "Is the Antonov An-225 Mriya the world's heaviest aircraft ever built and was it Ukrainian?", correct: true },
+  { id: 'arsenalna', prompt: "Is Kyiv's Arsenalna metro station one of the deepest metro stations in the world?", correct: true },
+  { id: 'klitschko', prompt: 'Did Ukrainian boxers Vitali and Wladimir Klitschko both become world heavyweight champions?', correct: true },
+  { id: 'riga-capital', prompt: 'Is Riga the capital of Latvia?', correct: true },
+  { id: 'latvia-baltic-state', prompt: 'Is Latvia one of the three Baltic states?', correct: true },
+  { id: 'latvia-baltic-sea', prompt: 'Does Latvia border the Baltic Sea?', correct: true },
+  { id: 'latvia-ukraine-border', prompt: 'Does Latvia share a land border with Ukraine?', correct: false },
+  { id: 'latvian-flag', prompt: 'Is the Latvian flag carmine red with a white horizontal stripe?', correct: true },
+  { id: 'latvian-latin', prompt: 'Is Latvian written with the Latin alphabet?', correct: true },
+  { id: 'latvia-euro', prompt: 'Does Latvia use the euro?', correct: true },
+  { id: 'latvia-eu-nato', prompt: 'Is Latvia a member of the European Union and NATO?', correct: true },
+  { id: 'latvia-russia-border', prompt: 'Does Latvia share a land border with Russia?', correct: true },
+  { id: 'daugava-riga', prompt: 'Is Daugava the river that flows through Riga?', correct: true },
+  { id: 'song-dance', prompt: "Is Latvian Song and Dance Celebration part of Latvia's major cultural heritage?", correct: true },
+];
+
+export class MemoryAccessGateStore {
+  constructor() {
+    this.records = new Map();
+  }
+
+  async setJSON(key, value) {
+    this.records.set(key, structuredClone(value));
+  }
+
+  async get(key, options = {}) {
+    const value = this.records.get(key);
+    if (value === undefined) return null;
+    if (options.type === 'json') return structuredClone(value);
+    return JSON.stringify(value);
+  }
+
+  async delete(key) {
+    this.records.delete(key);
+  }
+}
+
+export function getAccessGateStore() {
+  return getStore({ name: 'gdebenz-access-gate', consistency: 'strong' });
+}
+
+function shuffledCopy(items, rng = Math.random) {
+  const copy = [...items];
+  for (let index = copy.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(rng() * (index + 1));
+    [copy[index], copy[swapIndex]] = [copy[swapIndex], copy[index]];
+  }
+  return copy;
+}
+
+function accessError(code, status = 401) {
+  const error = new Error(code);
+  error.code = code;
+  error.status = status;
+  return error;
+}
+
+export async function createAccessChallenge(store = getAccessGateStore(), options = {}) {
+  const now = options.now ?? Date.now();
+  const id = options.id || crypto.randomUUID();
+  const rng = options.rng || Math.random;
+  const questions = shuffledCopy(ACCESS_QUESTION_BANK, rng).slice(0, 3).map((question) => ({
+    ...question,
+    answers: shuffledCopy([
+      { label: 'Yes', value: true },
+      { label: 'No', value: false },
+    ], rng),
+  }));
+  const challenge = {
+    id,
+    questions,
+    issuedAt: now,
+    expiresAt: now + ACCESS_CHALLENGE_TTL_MS,
+  };
+  await store.setJSON(`challenges/${id}`, challenge);
+  return challenge;
+}
+
+export function publicChallenge(challenge) {
+  return {
+    challengeId: challenge.id,
+    questions: challenge.questions.map((question) => ({
+      id: question.id,
+      prompt: question.prompt,
+      answers: question.answers,
+    })),
+  };
+}
+
+export function validateAccessAnswers(challenge, answers = {}) {
+  return Array.isArray(challenge?.questions)
+    && challenge.questions.length === 3
+    && challenge.questions.every((question) => answers[question.id] === question.correct);
+}
+
+export async function issueAccessToken(store = getAccessGateStore(), options = {}) {
+  const now = options.now ?? Date.now();
+  const challenge = await store.get(`challenges/${options.challengeId}`, { type: 'json' });
+  if (!challenge || now > Number(challenge.expiresAt || 0)) throw accessError('access_challenge_expired', 403);
+  if (!validateAccessAnswers(challenge, options.answers || {})) throw accessError('access_answers_incorrect', 403);
+  const token = options.token || crypto.randomUUID();
+  const record = {
+    token,
+    accessSessionId: String(options.accessSessionId || ''),
+    ipKey: options.ipKey,
+    issuedAt: now,
+    expiresAt: now + ACCESS_TOKEN_TTL_MS,
+  };
+  if (!record.accessSessionId) throw accessError('access_session_required', 400);
+  await store.setJSON(`tokens/${token}`, record);
+  await store.delete(`challenges/${options.challengeId}`).catch(() => {});
+  return { accessToken: token, expiresAt: record.expiresAt };
+}
+
+export async function assertAccessToken(store = getAccessGateStore(), options = {}) {
+  if (!options.accessToken) throw accessError('access_token_required');
+  const record = await store.get(`tokens/${options.accessToken}`, { type: 'json' });
+  if (!record) throw accessError('access_token_invalid');
+  if (options.now > Number(record.expiresAt || 0)) throw accessError('access_token_expired');
+  if (record.accessSessionId !== options.accessSessionId) throw accessError('access_session_mismatch');
+  if (record.ipKey !== options.ipKey) throw accessError('access_ip_mismatch');
+  return record;
+}
+
+export async function assertRequestAccess(req, store = getAccessGateStore(), now = Date.now()) {
+  const url = new URL(req.url);
+  return assertAccessToken(store, {
+    accessToken: req.headers.get('x-access-token') || url.searchParams.get('accessToken') || '',
+    accessSessionId: req.headers.get('x-access-session') || url.searchParams.get('accessSessionId') || '',
+    ipKey: requestIpKey(req),
+    now,
+  });
+}
+```
+
+- [ ] **Step 5: Implement the access-token function**
+
+Create `netlify/functions/access-token.mjs`:
+
+```javascript
+import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/http.mjs';
+import { requestIpKey } from './lib/request-context.mjs';
+import {
+  createAccessChallenge,
+  getAccessGateStore,
+  issueAccessToken,
+  publicChallenge,
+} from './lib/access-gate-store.mjs';
+
+export async function handleAccessTokenRequest(req, options = {}) {
+  const store = options.store || getAccessGateStore();
+  const nowFn = options.nowFn || Date.now;
+  const rng = options.rng || Math.random;
+  const idFn = options.idFn || crypto.randomUUID;
+  const tokenFn = options.tokenFn || crypto.randomUUID;
+
+  if (req.method === 'GET') {
+    const challenge = await createAccessChallenge(store, {
+      now: nowFn(),
+      id: idFn(),
+      rng,
+    });
+    return jsonResponse(publicChallenge(challenge));
+  }
+
+  if (req.method === 'POST') {
+    const body = await readJson(req);
+    try {
+      return jsonResponse(await issueAccessToken(store, {
+        challengeId: body.challengeId,
+        answers: body.answers || {},
+        accessSessionId: body.accessSessionId,
+        ipKey: requestIpKey(req),
+        now: nowFn(),
+        token: tokenFn(),
+      }));
+    } catch (error) {
+      return errorResponse(error.status || 400, error.code || error.message || 'access_denied');
+    }
+  }
+
+  return methodNotAllowed(['GET', 'POST']);
+}
+
+export default async function handler(req) {
+  return handleAccessTokenRequest(req);
+}
+
+export const config = { path: '/api/access-token' };
+```
+
+- [ ] **Step 6: Run backend access tests and verify GREEN**
+
+Run:
+
+```bash
+npm test -- tests/access-gate.test.mjs
+```
+
+Expected: PASS for all access gate backend tests.
+
+- [ ] **Step 7: Protect existing Netlify API endpoints**
+
+In each existing handler file `netlify/functions/config.mjs`, `netlify/functions/stations.mjs`, `netlify/functions/station-ids.mjs`, `netlify/functions/vote-preview.mjs`, `netlify/functions/city-search.mjs`, `netlify/functions/avatars.mjs`, `netlify/functions/presence.mjs`, and `netlify/functions/vote.mjs`, import access validation:
+
+```javascript
+import { assertRequestAccess } from './lib/access-gate-store.mjs';
+import { errorResponse } from './lib/http.mjs';
+```
+
+At the start of each default handler, before expensive work and after any method gate, add:
+
+```javascript
+try {
+  await assertRequestAccess(req);
+} catch (error) {
+  return errorResponse(error.status || 401, error.code || error.message || 'access_denied');
+}
+```
+
+If a file already imports `errorResponse`, add only `assertRequestAccess` and reuse the existing `errorResponse` import.
+
+- [ ] **Step 8: Write failing questionnaire frontend tests**
+
+Extend the jsdom harness in `tests/frontend-dom.test.mjs` with this gate markup:
+
+```html
+<div id="access-gate-modal" hidden>
+  <form id="access-gate-form">
+    <div id="access-question-list"></div>
+    <div id="access-gate-error" hidden></div>
+    <button id="access-submit" type="submit">Continue</button>
+  </form>
+</div>
+```
+
+Append these tests:
+
+```javascript
+it('renders server-provided access questions and shuffled answer controls', () => {
+  const { context } = loadFrontendHarness();
+
+  const answerOrder = vm.runInContext(`
+    state.accessChallenge = {
+      challengeId: 'challenge-front',
+      questions: [{
+        id: 'crimea',
+        prompt: 'Is Crimea part of Ukraine?',
+        answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }]
+      }, {
+        id: 'riga',
+        prompt: 'Is Riga the capital of Latvia?',
+        answers: [{ label: 'No', value: false }, { label: 'Yes', value: true }]
+      }, {
+        id: 'baltic',
+        prompt: 'Does Ukraine border the Baltic Sea?',
+        answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }]
+      }]
+    };
+    renderAccessGate();
+    [...document.querySelectorAll('input[name="access-riga"]')].map((input) => input.value);
+  `, context);
+
+  assert.deepEqual(answerOrder, ['false', 'true']);
+});
+
+it('stores access token and session id after a correct questionnaire submit', async () => {
+  const { context, dom } = loadFrontendHarness();
+  const postedBodies = [];
+
+  context.fetch = async (url, options = {}) => {
+    if (String(url) === '/api/access-token' && options.method === 'POST') {
+      postedBodies.push(JSON.parse(options.body));
+      return { ok: true, json: async () => ({ accessToken: 'token-one', expiresAt: 12345 }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  await vm.runInContext(`
+    state.accessSessionId = 'access-session-one';
+    state.accessChallenge = {
+      challengeId: 'challenge-front',
+      questions: [
+        { id: 'crimea', prompt: 'Is Crimea part of Ukraine?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+        { id: 'riga', prompt: 'Is Riga the capital of Latvia?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+        { id: 'baltic', prompt: 'Does Ukraine border the Baltic Sea?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] }
+      ]
+    };
+    renderAccessGate();
+    document.querySelector('input[name="access-crimea"][value="true"]').checked = true;
+    document.querySelector('input[name="access-riga"][value="true"]').checked = true;
+    document.querySelector('input[name="access-baltic"][value="false"]').checked = true;
+    submitAccessGate(new window.Event('submit', { bubbles: true, cancelable: true }));
+  `, context);
+
+  assert.equal(postedBodies[0].challengeId, 'challenge-front');
+  assert.equal(postedBodies[0].accessSessionId, 'access-session-one');
+  assert.equal(dom.window.sessionStorage.getItem('gdebenz.accessToken.v1'), 'token-one');
+  assert.equal(dom.window.document.getElementById('access-gate-modal')?.hidden, true);
+});
+
+it('fetches a fresh challenge after an incorrect questionnaire submit', async () => {
+  const { context, dom } = loadFrontendHarness();
+  let challengeFetches = 0;
+
+  context.fetch = async (url, options = {}) => {
+    if (String(url) === '/api/access-token' && options.method === 'POST') {
+      return { ok: false, json: async () => ({ detail: 'access_answers_incorrect' }) };
+    }
+    if (String(url) === '/api/access-token') {
+      challengeFetches += 1;
+      return {
+        ok: true,
+        json: async () => ({
+          challengeId: `retry-${challengeFetches}`,
+          questions: [
+            { id: 'latvia-sea', prompt: 'Does Latvia border the Baltic Sea?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+            { id: 'riga', prompt: 'Is Riga the capital of Latvia?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+            { id: 'crimea', prompt: 'Is Crimea part of Ukraine?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] }
+          ]
+        }),
+      };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+
+  await vm.runInContext(`
+    state.accessSessionId = 'access-session-one';
+    state.accessChallenge = {
+      challengeId: 'challenge-front',
+      questions: [
+        { id: 'crimea', prompt: 'Is Crimea part of Ukraine?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+        { id: 'riga', prompt: 'Is Riga the capital of Latvia?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+        { id: 'baltic', prompt: 'Does Ukraine border the Baltic Sea?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] }
+      ]
+    };
+    renderAccessGate();
+    document.querySelector('input[name="access-crimea"][value="true"]').checked = true;
+    document.querySelector('input[name="access-riga"][value="true"]').checked = true;
+    document.querySelector('input[name="access-baltic"][value="true"]').checked = true;
+    submitAccessGate(new window.Event('submit', { bubbles: true, cancelable: true }));
+  `, context);
+
+  assert.equal(dom.window.document.getElementById('access-gate-modal')?.hidden, false);
+  assert.equal(dom.window.document.getElementById('access-gate-error')?.hidden, false);
+  assert.equal(vm.runInContext('state.accessChallenge.challengeId', context), 'retry-1');
+});
+
+it('adds access token headers to dynamic API calls', async () => {
+  const { context, dom } = loadFrontendHarness();
+  const seenHeaders = [];
+
+  dom.window.sessionStorage.setItem('gdebenz.accessToken.v1', 'token-one');
+  dom.window.sessionStorage.setItem('gdebenz.accessSession.v1', 'access-session-one');
+  context.fetch = async (_url, options = {}) => {
+    seenHeaders.push(options.headers);
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+
+  await vm.runInContext(`api('/api/config')`, context);
+
+  assert.equal(seenHeaders[0]['x-access-token'], 'token-one');
+  assert.equal(seenHeaders[0]['x-access-session'], 'access-session-one');
+});
+```
+
+- [ ] **Step 9: Run frontend tests and verify RED**
+
+Run:
+
+```bash
+npm test -- tests/frontend-dom.test.mjs
+```
+
+Expected: FAIL because token-backed access gate frontend helpers and markup do not exist yet.
+
+- [ ] **Step 10: Add access gate markup before the identity gate**
+
+In `gdebenz_ui/static/index.html`, add this modal before the existing identity modal:
+
+```html
+<div id="access-gate-modal" class="access-gate-modal" hidden>
+  <form id="access-gate-form" class="access-gate-card">
+    <div class="access-gate-kicker">Riga / Kyiv checkpoint</div>
+    <div class="access-gate-title">Latvia stands with Ukraine</div>
+    <p class="access-gate-copy">
+      Answer all three to enter. A miss gives you a fresh set.
+    </p>
+    <div id="access-question-list" class="access-question-list"></div>
+    <div id="access-gate-error" class="access-gate-error" hidden>
+      Not quite. Try a fresh set.
+    </div>
+    <button id="access-submit" class="btn btn-primary" type="submit">Continue</button>
+  </form>
+</div>
+```
+
+- [ ] **Step 11: Add frontend token state and API headers**
+
+In `gdebenz_ui/static/app.js`, add these constants near the identity constants:
+
+```javascript
+const ACCESS_TOKEN_KEY = 'gdebenz.accessToken.v1';
+const ACCESS_SESSION_KEY = 'gdebenz.accessSession.v1';
+```
+
+Add `accessChallenge: null` and `accessSessionId: ''` to `state`.
+
+Update `api(path, opts = {})` so it includes the token headers:
+
+```javascript
+const accessToken = sessionStorage.getItem(ACCESS_TOKEN_KEY) || '';
+const accessSessionId = sessionStorage.getItem(ACCESS_SESSION_KEY) || state.accessSessionId || '';
+const res = await fetch(path, {
+  headers: {
+    'Content-Type': 'application/json',
+    ...(accessToken ? { 'x-access-token': accessToken } : {}),
+    ...(accessSessionId ? { 'x-access-session': accessSessionId } : {}),
+    ...opts.headers,
+  },
+  ...opts,
+});
+if (res.status === 401) {
+  sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  showAccessGate();
+}
+```
+
+- [ ] **Step 12: Add frontend challenge fetching and token submit flow**
+
+In `gdebenz_ui/static/app.js`, replace the first `state.config = await api('/api/config')` block in `init()` with an access gate check:
+
+```javascript
+initAccessGate();
+if (!accessTokenReady()) return;
+await loadInitialConfig();
+```
+
+Create `loadInitialConfig()` with the previous config-loading body:
+
+```javascript
+async function loadInitialConfig() {
+  try {
+    state.config = await api('/api/config');
+    renderFuelChips();
+    renderStatusChips();
+    renderVoteStatusOptions();
+    renderCitySelect();
+    renderBrandSelect();
+  } catch (e) {
+    toast('Config load error: ' + e.message);
+  }
+}
+```
+
+Add these access helpers:
+
+```javascript
+function accessTokenReady() {
+  return Boolean(sessionStorage.getItem(ACCESS_TOKEN_KEY) && sessionStorage.getItem(ACCESS_SESSION_KEY));
+}
+
+function initAccessGate() {
+  const form = $('#access-gate-form');
+  if (form && form.dataset.boundAccessGate !== 'true') {
+    form.dataset.boundAccessGate = 'true';
+    form.addEventListener('submit', submitAccessGate);
+  }
+  state.accessSessionId = sessionStorage.getItem(ACCESS_SESSION_KEY) || randomId();
+  sessionStorage.setItem(ACCESS_SESSION_KEY, state.accessSessionId);
+  if (accessTokenReady()) {
+    $('#access-gate-modal').hidden = true;
+    return;
+  }
+  showAccessGate();
+}
+
+async function showAccessGate() {
+  sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  const modal = $('#access-gate-modal');
+  if (modal) modal.hidden = false;
+  const response = await fetch('/api/access-token');
+  if (!response.ok) {
+    toast('Access challenge failed');
+    return;
+  }
+  state.accessChallenge = await response.json();
+  renderAccessGate();
+}
+
+function renderAccessGate() {
+  const modal = $('#access-gate-modal');
+  const list = $('#access-question-list');
+  const error = $('#access-gate-error');
+  if (!modal || !list) return;
+  if (error) error.hidden = true;
+  const questions = state.accessChallenge?.questions || [];
+  list.innerHTML = questions.map((question, index) => `
+    <fieldset class="access-question">
+      <legend>${index + 1}. ${esc(question.prompt)}</legend>
+      <div class="access-answer-row">
+        ${question.answers.map((answer) => `
+          <label class="access-answer">
+            <input type="radio" name="access-${esc(question.id)}" value="${answer.value}" required>
+            <span>${esc(answer.label)}</span>
+          </label>
+        `).join('')}
+      </div>
+    </fieldset>
+  `).join('');
+  modal.hidden = false;
+}
+
+async function submitAccessGate(event) {
+  event.preventDefault();
+  const answers = {};
+  const questions = state.accessChallenge?.questions || [];
+  for (const question of questions) {
+    const checked = document.querySelector(`input[name="access-${CSS.escape(question.id)}"]:checked`);
+    if (!checked) return;
+    answers[question.id] = checked.value === 'true';
+  }
+  const response = await fetch('/api/access-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      challengeId: state.accessChallenge.challengeId,
+      answers,
+      accessSessionId: state.accessSessionId,
+    }),
+  });
+  if (response.ok) {
+    const token = await response.json();
+    sessionStorage.setItem(ACCESS_TOKEN_KEY, token.accessToken);
+    $('#access-gate-modal').hidden = true;
+    await loadInitialConfig();
+    initIdentityGate();
+    return;
+  }
+  const error = $('#access-gate-error');
+  if (error) error.hidden = false;
+  await showAccessGate();
+}
+```
+
+- [ ] **Step 13: Add questionnaire styling**
+
+In `gdebenz_ui/static/style.css`, add:
+
+```css
+.access-gate-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background:
+    linear-gradient(135deg, rgba(0, 87, 183, .2), rgba(157, 34, 53, .18)),
+    rgba(3, 7, 18, .86);
+  backdrop-filter: blur(10px);
+}
+.access-gate-modal[hidden] { display: none; }
+.access-gate-card {
+  width: min(560px, 100%);
+  border: 1px solid rgba(226, 232, 240, .18);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, .96), rgba(11, 15, 22, .98)),
+    var(--bg-card);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .48);
+  padding: 18px;
+}
+.access-gate-kicker {
+  color: #fde047;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+}
+.access-gate-title {
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 22px;
+  font-weight: 900;
+}
+.access-gate-copy,
+.access-gate-error {
+  margin-top: 6px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.access-gate-error {
+  color: #fecdd3;
+}
+.access-question-list {
+  display: grid;
+  gap: 10px;
+  margin: 14px 0;
+}
+.access-question {
+  border: 1px solid rgba(75, 93, 121, .55);
+  border-radius: 6px;
+  padding: 10px;
+  background: rgba(26, 31, 46, .68);
+}
+.access-question legend {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+  padding: 0 4px;
+}
+.access-answer-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.access-answer {
+  flex: 1;
+  cursor: pointer;
+}
+.access-answer input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.access-answer span {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  color: var(--text-dim);
+  text-align: center;
+  font-size: 13px;
+  font-weight: 800;
+  background: var(--bg-input);
+}
+.access-answer input:checked + span {
+  border-color: #fde047;
+  color: #0b0f16;
+  background: #fde047;
+}
+```
+
+- [ ] **Step 14: Run frontend and access tests and verify GREEN**
+
+Run:
+
+```bash
+npm test -- tests/access-gate.test.mjs
+npm test -- tests/frontend-dom.test.mjs
+```
+
+Expected: both test files pass.
+
+- [ ] **Step 15: Commit Task 0**
+
+Run:
+
+```bash
+git add netlify/functions/lib/request-context.mjs netlify/functions/lib/access-gate-store.mjs netlify/functions/access-token.mjs tests/access-gate.test.mjs netlify/functions/config.mjs netlify/functions/stations.mjs netlify/functions/station-ids.mjs netlify/functions/vote-preview.mjs netlify/functions/city-search.mjs netlify/functions/avatars.mjs netlify/functions/presence.mjs netlify/functions/vote.mjs gdebenz_ui/static/index.html gdebenz_ui/static/style.css gdebenz_ui/static/app.js tests/frontend-dom.test.mjs
+git commit -m "Add Latvian Ukrainian access token gate"
+```
 
 ---
 
@@ -158,9 +1071,15 @@ npm test -- tests/presence.test.mjs
 
 Expected: FAIL because `sessionId`, `session`, `ipKey`, and stale-delete behavior do not exist yet.
 
-- [ ] **Step 3: Implement request IP and session normalization**
+- [ ] **Step 3: Implement session normalization and shared request IP usage**
 
-In `netlify/functions/lib/presence-store.mjs`, add these helpers near the existing normalization helpers:
+In `netlify/functions/lib/presence-store.mjs`, import the shared IP helper near the top:
+
+```javascript
+import { requestIpKey } from './request-context.mjs';
+```
+
+Add this helper near the existing normalization helpers:
 
 ```javascript
 function normalizeSessionId(value) {
@@ -169,19 +1088,6 @@ function normalizeSessionId(value) {
     .replace(/^-+|-+$/g, '');
   if (!normalized) throw new Error('sessionId is required');
   return normalized;
-}
-
-export function requestIpKey(req) {
-  const headers = req?.headers;
-  const raw = headers?.get('x-nf-client-connection-ip')
-    || headers?.get('client-ip')
-    || headers?.get('cf-connecting-ip')
-    || headers?.get('x-real-ip')
-    || headers?.get('x-forwarded-for')
-    || 'local';
-  const first = String(raw).split(',')[0].trim().toLowerCase();
-  const safe = first.replace(/[^a-z0-9:._-]+/g, '-').replace(/^-+|-+$/g, '');
-  return `ip:${safe || 'local'}`;
 }
 ```
 
@@ -775,6 +1681,7 @@ import {
   createPresenceRecord,
   presenceKey,
 } from '../netlify/functions/lib/presence-store.mjs';
+import { MemoryAccessGateStore } from '../netlify/functions/lib/access-gate-store.mjs';
 import { readQueueState } from '../netlify/functions/lib/vote-queue-store.mjs';
 import { handleVoteRequest } from '../netlify/functions/vote.mjs';
 import voteQueueHandler from '../netlify/functions/vote-queue.mjs';
@@ -790,10 +1697,32 @@ function activeRecord(overrides = {}) {
   }, overrides.now || 1_000_000, overrides.ipKey || 'ip:203.0.113.44');
 }
 
+async function activeAccessStore() {
+  const accessStore = new MemoryAccessGateStore();
+  await accessStore.setJSON('tokens/test-access-token', {
+    token: 'test-access-token',
+    accessSessionId: 'access-session-one',
+    ipKey: 'ip:203.0.113.44',
+    issuedAt: 1_000_000,
+    expiresAt: 9_000_000,
+  });
+  return accessStore;
+}
+
+function accessHeaders(extra = {}) {
+  return {
+    'x-forwarded-for': '203.0.113.44',
+    'x-access-token': 'test-access-token',
+    'x-access-session': 'access-session-one',
+    ...extra,
+  };
+}
+
 describe('Netlify queued vote route', () => {
   it('submits an active Benzin vote through the queue', async () => {
     const presenceStore = new MemoryPresenceStore();
     const queueStore = new MemoryPresenceStore();
+    const accessStore = await activeAccessStore();
     await presenceStore.setJSON(presenceKey('client-one'), activeRecord());
 
     const postedBodies = [];
@@ -811,7 +1740,7 @@ describe('Netlify queued vote route', () => {
       let now = 1_000_100;
       const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
         method: 'POST',
-        headers: { 'x-forwarded-for': '203.0.113.44' },
+        headers: accessHeaders(),
         body: JSON.stringify({
           clientId: 'client-one',
           sessionId: 'session-one',
@@ -820,6 +1749,7 @@ describe('Netlify queued vote route', () => {
           vote_status: 'available',
         }),
       }), {
+        accessStore,
         presenceStore,
         queueStore,
         nowFn: () => now += 2100,
@@ -845,6 +1775,7 @@ describe('Netlify queued vote route', () => {
   it('rejects stale sessions before enqueueing a vote', async () => {
     const presenceStore = new MemoryPresenceStore();
     const queueStore = new MemoryPresenceStore();
+    const accessStore = await activeAccessStore();
     await presenceStore.setJSON(presenceKey('client-one'), activeRecord({
       sessionId: 'new-session',
       now: 2_000_000,
@@ -852,7 +1783,7 @@ describe('Netlify queued vote route', () => {
 
     const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
       method: 'POST',
-      headers: { 'x-forwarded-for': '203.0.113.44' },
+      headers: accessHeaders(),
       body: JSON.stringify({
         clientId: 'client-one',
         sessionId: 'old-session',
@@ -861,6 +1792,7 @@ describe('Netlify queued vote route', () => {
         vote_status: 'available',
       }),
     }), {
+      accessStore,
       presenceStore,
       queueStore,
       nowFn: () => 2_000_500,
@@ -876,7 +1808,11 @@ describe('Netlify queued vote route', () => {
 
   it('returns a public queue snapshot without private fields', async () => {
     const queueStore = new MemoryPresenceStore();
-    const response = await voteQueueHandler(new Request('http://localhost/api/vote/queue'), {
+    const accessStore = await activeAccessStore();
+    const response = await voteQueueHandler(new Request('http://localhost/api/vote/queue', {
+      headers: accessHeaders(),
+    }), {
+      accessStore,
       queueStore,
       nowFn: () => 10_000,
     });
@@ -964,10 +1900,16 @@ import {
   publicQueueSnapshot,
   readQueueState,
 } from './lib/vote-queue-store.mjs';
-import { jsonResponse, methodNotAllowed } from './lib/http.mjs';
+import { assertRequestAccess, getAccessGateStore } from './lib/access-gate-store.mjs';
+import { errorResponse, jsonResponse, methodNotAllowed } from './lib/http.mjs';
 
 export default async function handler(req, options = {}) {
   if (req.method !== 'GET') return methodNotAllowed(['GET']);
+  try {
+    await assertRequestAccess(req, options.accessStore || getAccessGateStore(), (options.nowFn || Date.now)());
+  } catch (error) {
+    return errorResponse(error.status || 401, error.code || error.message || 'access_denied');
+  }
   const queueStore = options.queueStore || getVoteQueueStore();
   const nowFn = options.nowFn || Date.now;
   const state = await readQueueState(queueStore);
@@ -988,12 +1930,13 @@ import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/h
 import {
   assertActiveSession,
   getPresenceStore,
-  requestIpKey,
 } from './lib/presence-store.mjs';
+import { requestIpKey } from './lib/request-context.mjs';
 import {
   getVoteQueueStore,
   runQueuedVote,
 } from './lib/vote-queue-store.mjs';
+import { assertRequestAccess, getAccessGateStore } from './lib/access-gate-store.mjs';
 
 function identityFromBodyAndRequest(body, req) {
   return {
@@ -1013,6 +1956,11 @@ function staleSessionResponse(error) {
 
 export async function handleVoteRequest(req, options = {}) {
   if (req.method !== 'POST') return methodNotAllowed(['POST']);
+  try {
+    await assertRequestAccess(req, options.accessStore || getAccessGateStore(), (options.nowFn || Date.now)());
+  } catch (error) {
+    return errorResponse(error.status || 401, error.code || error.message || 'access_denied');
+  }
   const body = await readJson(req);
   const source = body.source || 'gdebenz';
   const presenceStore = options.presenceStore || getPresenceStore();
@@ -1186,6 +2134,18 @@ function identity() {
   };
 }
 
+async function activeAccessStore() {
+  const accessStore = new MemoryAccessGateStore();
+  await accessStore.setJSON('tokens/chat-access-token', {
+    token: 'chat-access-token',
+    accessSessionId: 'chat-access-session',
+    ipKey: 'ip:203.0.113.55',
+    issuedAt: 5_000,
+    expiresAt: 500_000,
+  });
+  return accessStore;
+}
+
 describe('chat store', () => {
   it('normalizes and clips chat text', () => {
     assert.equal(normalizeChatText('  hello  '), 'hello');
@@ -1216,6 +2176,7 @@ describe('chat store', () => {
   it('rejects stale chat posts', async () => {
     const presenceStore = new MemoryPresenceStore();
     const chatStore = new MemoryPresenceStore();
+    const accessStore = await activeAccessStore();
     await presenceStore.setJSON(presenceKey('client-one'), createPresenceRecord({
       clientId: 'client-one',
       sessionId: 'fresh-session',
@@ -1227,13 +2188,18 @@ describe('chat store', () => {
 
     const response = await handleChatRequest(new Request('https://site.test/api/chat', {
       method: 'POST',
-      headers: { 'x-forwarded-for': '203.0.113.55' },
+      headers: {
+        'x-forwarded-for': '203.0.113.55',
+        'x-access-token': 'chat-access-token',
+        'x-access-session': 'chat-access-session',
+      },
       body: JSON.stringify({
         clientId: 'client-one',
         sessionId: 'stale-session',
         text: 'should not send',
       }),
     }), {
+      accessStore,
       presenceStore,
       chatStore,
       nowFn: () => 5_500,
@@ -1336,13 +2302,14 @@ Create `netlify/functions/chat.mjs`:
 import {
   assertActiveSession,
   getPresenceStore,
-  requestIpKey,
 } from './lib/presence-store.mjs';
+import { requestIpKey } from './lib/request-context.mjs';
 import {
   appendChatMessage,
   chatSnapshot,
   getChatStore,
 } from './lib/chat-store.mjs';
+import { assertRequestAccess, getAccessGateStore } from './lib/access-gate-store.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/http.mjs';
 
 function identityFromBodyAndRequest(body, req) {
@@ -1358,7 +2325,14 @@ function identityFromBodyAndRequest(body, req) {
 export async function handleChatRequest(req, options = {}) {
   const presenceStore = options.presenceStore || getPresenceStore();
   const chatStore = options.chatStore || getChatStore();
+  const accessStore = options.accessStore || getAccessGateStore();
   const nowFn = options.nowFn || Date.now;
+
+  try {
+    await assertRequestAccess(req, accessStore, nowFn());
+  } catch (error) {
+    return errorResponse(error.status || 401, error.code || error.message || 'access_denied');
+  }
 
   if (req.method === 'GET') {
     return jsonResponse(await chatSnapshot(chatStore, nowFn()));
@@ -2112,6 +3086,6 @@ Stop the process with `Ctrl+C` and ensure no needed terminal session remains run
 
 ## Self-Review Checklist
 
-- Spec coverage: Tasks 1 and 5 cover `clientId`/IP session replacement and blocking UI; Tasks 2 and 3 cover fair public queueing, one active vote per `clientId`/IP, shuffling, and 2 second global rate limiting; Task 4 covers chat; Task 6 covers privacy and verification.
+- Spec coverage: Task 0 covers the Latvian + Ukrainian questionnaire, server-side challenge validation, retry-on-fail, session token issuance, and protected API access; Tasks 1 and 5 cover `clientId`/IP session replacement and blocking UI; Tasks 2 and 3 cover fair public queueing, one active vote per `clientId`/IP, shuffling, and 2 second global rate limiting; Task 4 covers chat; Task 6 covers privacy and verification.
 - Placeholder scan: The plan contains concrete file paths, test code, implementation snippets, commands, and expected results.
 - Type consistency: Identity fields are `clientId`, `sessionId`, `ipKey`, `handle`, and `avatar` throughout backend stores and frontend payloads. Vote queue public fields are `id`, `clientId`, `handle`, `avatar`, `source`, `stationId`, `status`, `queuedAt`, `queuedAgeMs`, `state`, and `position`.
