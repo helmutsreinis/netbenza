@@ -83,6 +83,12 @@ function withMockFetch(mock, run) {
     });
 }
 
+class FailingWriteStore extends MemoryPresenceStore {
+  async setJSON() {
+    throw new Error('blob_write_failed');
+  }
+}
+
 describe('Netlify vote queue routes', () => {
   it('routes an active Benzin station vote through the queue and exposes an empty public snapshot', async () => {
     let now = 1_000_000;
@@ -369,6 +375,93 @@ describe('Netlify vote queue routes', () => {
     assert.equal(response.status, 504);
     assert.equal(body.detail, 'queue_wait_timeout');
     assert.deepEqual(state.entries.map((entry) => entry.id), ['queued-blocker']);
+  });
+
+  it('returns a route-level error when queue storage writes fail', async () => {
+    const now = 2_600_000;
+    const access = await accessContext({ now, ip: '198.51.100.61' });
+    const presenceStore = new MemoryPresenceStore();
+    const queueStore = new FailingWriteStore();
+
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+    });
+
+    const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
+      method: 'POST',
+      headers: { ...access.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        source: 'benzin',
+        osm_ids: ['123'],
+        vote_status: 'available',
+        clientId: 'client-one',
+        sessionId: 'session-one',
+      }),
+    }), {
+      accessStore: access.store,
+      presenceStore,
+      queueStore,
+      nowFn: () => now,
+      sleep: async () => {},
+      maxWaitMs: 5_000,
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.detail, 'blob_write_failed');
+  });
+
+  it('keeps upstream Benzin failures as item-level results after queue processing', async () => {
+    const now = 2_700_000;
+    const access = await accessContext({ now, ip: '198.51.100.62' });
+    const presenceStore = new MemoryPresenceStore();
+    const queueStore = new MemoryPresenceStore();
+
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+    });
+
+    await withMockFetch(async () => {
+      throw new Error('upstream_fetch_failed');
+    }, async () => {
+      const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
+        method: 'POST',
+        headers: { ...access.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          source: 'benzin',
+          osm_ids: ['123'],
+          vote_status: 'available',
+          clientId: 'client-one',
+          sessionId: 'session-one',
+        }),
+      }), {
+        accessStore: access.store,
+        presenceStore,
+        queueStore,
+        nowFn: () => now,
+        sleep: async () => {},
+        maxWaitMs: 5_000,
+      });
+      const body = await response.json();
+      const state = await readQueueState(queueStore, now);
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(body, [{
+        osm_id: '123',
+        name: 'Station #123',
+        success: false,
+        reason: 'Could not reach Benzin-Status. Please try again in a moment. (upstream_fetch_failed)',
+      }]);
+      assert.deepEqual(state.entries, []);
+    });
   });
 
   it('protects the public queue snapshot with the access gate', async () => {

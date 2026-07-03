@@ -41,26 +41,44 @@ async function assertVoteSession(req, body, options, nowFn) {
   };
 }
 
-const QUEUE_ROUTE_ERROR_CODES = new Set([
-  'client_active',
-  'clientId_required',
-  'id_required',
-  'ip_active',
-  'ipKey_required',
-  'queue_entry_invalid',
-  'queue_entry_missing',
-  'queue_wait_timeout',
-  'sessionId_required',
-  'stationId_required',
-  'status_required',
-  'submit_required',
-]);
+function safeRouteErrorDetail(error) {
+  const detail = String(error?.code || error?.message || 'vote_queue_failed');
+  return /^[a-zA-Z0-9_.:-]{1,120}$/.test(detail) ? detail : 'vote_queue_failed';
+}
 
 function queueRouteErrorResponse(error) {
   const status = Number(error?.status);
-  const code = String(error?.code || error?.message || '');
-  if (!Number.isInteger(status) || status < 400 || !QUEUE_ROUTE_ERROR_CODES.has(code)) return null;
-  return errorResponse(status, code || 'vote_queue_failed');
+  const responseStatus = Number.isInteger(status) && status >= 400 ? status : 503;
+  return errorResponse(responseStatus, safeRouteErrorDetail(error));
+}
+
+async function submitBenzinVoteResult(vote) {
+  try {
+    return await submitBenzinReport({
+      stationId: vote.stationId,
+      status: vote.status,
+    });
+  } catch (error) {
+    return {
+      osm_id: String(vote.stationId),
+      name: `Station #${vote.stationId}`,
+      success: false,
+      reason: error.message || 'Vote failed',
+    };
+  }
+}
+
+async function submitGdeBenzVoteResult(vote) {
+  try {
+    return await submitVote(vote);
+  } catch (error) {
+    return {
+      osm_id: String(vote.osm_id),
+      name: '',
+      success: false,
+      reason: error.message || 'Vote failed',
+    };
+  }
 }
 
 export async function handleVoteRequest(req, options = {}) {
@@ -106,20 +124,10 @@ export async function handleVoteRequest(req, options = {}) {
             stationId,
             status: body.vote_status,
           },
-          submit: async (vote) => submitBenzinReport({
-            stationId: vote.stationId,
-            status: vote.status,
-          }),
+          submit: submitBenzinVoteResult,
         }));
       } catch (error) {
-        const routeError = queueRouteErrorResponse(error);
-        if (routeError) return routeError;
-        results.push({
-          osm_id: stationId,
-          name: `Station #${stationId}`,
-          success: false,
-          reason: error.message || 'Vote failed',
-        });
+        return queueRouteErrorResponse(error);
       }
     }
     return jsonResponse(results);
@@ -163,17 +171,10 @@ export async function handleVoteRequest(req, options = {}) {
           vlon: voterCoords.lon,
           fingerprint: body.fingerprint || '',
         },
-        submit: async (vote) => submitVote(vote),
+        submit: submitGdeBenzVoteResult,
       }));
     } catch (error) {
-      const routeError = queueRouteErrorResponse(error);
-      if (routeError) return routeError;
-      results.push({
-        osm_id: stationId,
-        name: '',
-        success: false,
-        reason: error.message || 'Vote failed',
-      });
+      return queueRouteErrorResponse(error);
     }
   }
 
