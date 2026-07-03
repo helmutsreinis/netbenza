@@ -571,9 +571,9 @@ function renderAvatarGrid() {
   grid.innerHTML = avatars.map((avatar) => `
     <button class="avatar-choice ${avatar.url === state.pendingAvatar ? 'selected' : ''}"
             type="button"
-            data-avatar="${esc(avatar.url)}"
-            title="${esc(avatar.file || avatar.id || 'Avatar')}">
-      <img src="${esc(avatar.url)}" alt="">
+            data-avatar="${attr(safeAvatarUrl(avatar.url))}"
+            title="${attr(avatar.file || avatar.id || 'Avatar')}">
+      ${safeAvatarUrl(avatar.url) ? `<img src="${attr(safeAvatarUrl(avatar.url))}" alt="">` : ''}
     </button>
   `).join('');
 
@@ -725,14 +725,14 @@ function renderOnlineUsers(users) {
   const visibleUsers = state.presenceUsers.slice(0, MAX_HEADER_ROSTER_USERS);
   const overflow = state.presenceUsers.length - visibleUsers.length;
   el.innerHTML = visibleUsers.map((user) => `
-    <div class="online-user" title="${esc(user.handle)} · ${esc(activityLabel(user.activity, user.detail))}">
-      ${user.avatar ? `<img src="${esc(user.avatar)}" alt="">` : ''}
+    <div class="online-user" title="${attr(`${user.handle || ''} · ${activityLabel(user.activity, user.detail)}`)}">
+      ${safeAvatarUrl(user.avatar) ? `<img src="${attr(safeAvatarUrl(user.avatar))}" alt="">` : ''}
       <span class="online-copy">
         <span class="online-name">${esc(user.handle)}</span>
         <span class="online-activity">${esc(activityLabel(user.activity, user.detail))}</span>
       </span>
     </div>
-  `).join('') + (overflow > 0 ? `<span class="online-more" title="${overflow} more online">+${overflow}</span>` : '');
+  `).join('') + (overflow > 0 ? `<span class="online-more" title="${attr(`${overflow} more online`)}">+${overflow}</span>` : '');
 }
 
 function activityLabel(activity, detail = '') {
@@ -851,7 +851,7 @@ function renderVoteQueue(data = {}) {
 function renderVoteQueueItem(entry) {
   const isProcessing = entry.state === 'processing';
   const handle = entry.handle || 'Anonymous';
-  const avatar = entry.avatar || '';
+  const avatar = safeAvatarUrl(entry.avatar);
   const source = entry.source || 'gdebenz';
   const station = entry.stationId || entry.osmId || entry.osm_id || entry.station || '';
   const status = entry.status || entry.voteStatus || '';
@@ -859,7 +859,7 @@ function renderVoteQueueItem(entry) {
 
   return `
     <article class="vote-queue-item ${isProcessing ? 'is-processing' : ''}">
-      ${avatar ? `<img class="collab-avatar" src="${esc(avatar)}" alt="">` : '<span class="collab-avatar collab-avatar-empty"></span>'}
+      ${avatar ? `<img class="collab-avatar" src="${attr(avatar)}" alt="">` : '<span class="collab-avatar collab-avatar-empty"></span>'}
       <div class="collab-copy">
         <div class="collab-line">
           <strong>${esc(handle)}</strong>
@@ -926,11 +926,11 @@ function renderChatMessages(messages = []) {
 
   list.innerHTML = state.chatMessages.map((message) => {
     const handle = message.handle || 'Anonymous';
-    const avatar = message.avatar || '';
+    const avatar = safeAvatarUrl(message.avatar);
     const time = formatChatTime(message.createdAt);
     return `
       <article class="chat-message">
-        ${avatar ? `<img class="collab-avatar" src="${esc(avatar)}" alt="">` : '<span class="collab-avatar collab-avatar-empty"></span>'}
+        ${avatar ? `<img class="collab-avatar" src="${attr(avatar)}" alt="">` : '<span class="collab-avatar collab-avatar-empty"></span>'}
         <div class="collab-copy">
           <div class="collab-line">
             <strong>${esc(handle)}</strong>
@@ -1690,6 +1690,23 @@ function renderResults(results) {
 }
 
 // ── Helpers ─────────────────────────────────────────
+function attr(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  })[ch]);
+}
+
+function safeAvatarUrl(value) {
+  const url = String(value || '').trim();
+  if (!url.startsWith('/avatars/') && !url.startsWith('/static/avatars/')) return '';
+  if (/[\s"'<>`\u0000-\u001f\u007f]/.test(url)) return '';
+  return url;
+}
+
 function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function statusColor(s) { return { yes: '#30D56B', queue: '#FF7A1A', low: '#FFC400', no: '#FF4D5A' }[s] || '#8A94A6'; }
 function toast(msg) {

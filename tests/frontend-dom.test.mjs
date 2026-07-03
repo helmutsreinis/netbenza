@@ -341,6 +341,28 @@ describe('frontend DOM updates', () => {
     assert.equal(dom.window.document.getElementById('vote-queue-count')?.textContent, '2');
   });
 
+  it('does not create queue avatar event attributes from server-supplied URLs', () => {
+    const { context, dom } = loadFrontendHarness();
+
+    vm.runInContext(`
+      renderVoteQueue({
+        entries: [{
+          id: 'entry-injection',
+          handle: 'Queue Operator',
+          avatar: '/avatars/x" onerror="alert(1)',
+          source: 'benzin',
+          stationId: 'station-101',
+          status: 'available',
+          position: 1
+        }]
+      });
+    `, context);
+
+    const list = dom.window.document.getElementById('vote-queue-list');
+    assert.equal(list?.querySelector('[onerror]'), null);
+    assert.doesNotMatch(list?.innerHTML || '', /onerror/i);
+  });
+
   it('renders chat messages with escaped text', () => {
     const { context, dom } = loadFrontendHarness();
 
@@ -358,6 +380,24 @@ describe('frontend DOM updates', () => {
     assert.match(messages?.textContent || '', /<img src=x onerror=alert\(1\)> hello/);
     assert.doesNotMatch(messages?.innerHTML || '', /<img src=x/i);
     assert.equal(dom.window.document.getElementById('chat-count')?.textContent, '1');
+  });
+
+  it('does not create chat avatar event attributes from server-supplied URLs', () => {
+    const { context, dom } = loadFrontendHarness();
+
+    vm.runInContext(`
+      renderChatMessages([{
+        id: 'message-injection',
+        handle: 'Nina',
+        avatar: '/avatars/x" onerror="alert(1)',
+        text: 'hello chat',
+        createdAt: 123
+      }]);
+    `, context);
+
+    const messages = dom.window.document.getElementById('chat-messages');
+    assert.equal(messages?.querySelector('[onerror]'), null);
+    assert.doesNotMatch(messages?.innerHTML || '', /onerror/i);
   });
 
   it('blocks stale replaced sessions from presence payloads and stops timers', () => {
