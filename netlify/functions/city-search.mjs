@@ -1,4 +1,7 @@
-import { searchCity } from './lib/gdebenz-client.mjs';
+import {
+  isGdeBenzUnavailableError,
+  searchCity,
+} from './lib/gdebenz-client.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed } from './lib/http.mjs';
 
 export default async function handler(req) {
@@ -10,7 +13,10 @@ export default async function handler(req) {
   try {
     return jsonResponse({ results: await searchCity(q) });
   } catch (error) {
-    return errorResponse(500, error.message || 'City search failed');
+    return errorResponse(
+      isGdeBenzUnavailableError(error) ? 502 : 500,
+      error.message || 'City search failed',
+    );
   }
 }
 

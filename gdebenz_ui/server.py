@@ -28,6 +28,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import Optional
 import uvicorn
+import requests
 
 app = FastAPI(title="GdeBenz Bulk Voter", version="1.0")
 
@@ -289,6 +290,13 @@ def _presence_snapshot() -> dict:
 
 # ── API Routes ───────────────────────────────────────────────
 
+def _gdebenz_unavailable(exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=502,
+        detail=f"Could not reach GdeBenz. Please try again in a moment. ({exc})",
+    )
+
+
 @app.get("/api/config", response_model=ConfigOut)
 def get_config():
     return ConfigOut(
@@ -321,7 +329,10 @@ def list_stations(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    stations, summary = api.get_nearby(clat, clon, radius)
+    try:
+        stations, summary = api.get_nearby(clat, clon, radius)
+    except requests.exceptions.RequestException as e:
+        raise _gdebenz_unavailable(e)
 
     fuel_types = [f.strip() for f in fuel.split(",")] if fuel else None
     statuses = [s.strip() for s in status.split(",")] if status else None
@@ -361,7 +372,10 @@ def list_station_ids(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    stations, _ = api.get_nearby(clat, clon, radius)
+    try:
+        stations, _ = api.get_nearby(clat, clon, radius)
+    except requests.exceptions.RequestException as e:
+        raise _gdebenz_unavailable(e)
 
     fuel_types = [f.strip() for f in fuel.split(",")] if fuel else None
     statuses = [s.strip() for s in status.split(",")] if status else None
@@ -387,7 +401,10 @@ def vote_preview(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    stations, _ = api.get_nearby(clat, clon, radius)
+    try:
+        stations, _ = api.get_nearby(clat, clon, radius)
+    except requests.exceptions.RequestException as e:
+        raise _gdebenz_unavailable(e)
 
     fuel_types = [f.strip() for f in fuel.split(",")] if fuel else None
     statuses = [s.strip() for s in status.split(",")] if status else None

@@ -85,6 +85,19 @@ export const AVATAR_FILES = [
 
 const tokenCache = new Map();
 
+export class GdeBenzUnavailableError extends Error {
+  constructor(cause) {
+    const detail = cause?.message || String(cause || 'request failed');
+    super(`Could not reach GdeBenz. Please try again in a moment. (${detail})`);
+    this.name = 'GdeBenzUnavailableError';
+    this.cause = cause;
+  }
+}
+
+export function isGdeBenzUnavailableError(error) {
+  return error instanceof GdeBenzUnavailableError;
+}
+
 function numberOrZero(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
@@ -259,16 +272,24 @@ export function queryOptions(searchParams) {
 }
 
 async function fetchJson(path, options = {}, fetchImpl = fetch) {
-  const response = await fetchImpl(`${BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      'user-agent': 'gdebenz-netlify/1.0',
-      accept: 'application/json',
-      ...(options.headers || {}),
-    },
-  });
+  let response;
+  try {
+    response = await fetchImpl(`${BASE_URL}${path}`, {
+      ...options,
+      headers: {
+        'user-agent': 'gdebenz-netlify/1.0',
+        accept: 'application/json',
+        ...(options.headers || {}),
+      },
+    });
+  } catch (error) {
+    throw new GdeBenzUnavailableError(error);
+  }
   if (!response.ok) {
     const detail = await response.text().catch(() => response.statusText);
+    if (response.status >= 500) {
+      throw new GdeBenzUnavailableError(new Error(detail || response.statusText));
+    }
     throw new Error(detail || response.statusText);
   }
   return response.json();

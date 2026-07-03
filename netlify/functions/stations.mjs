@@ -1,4 +1,8 @@
-import { listStations, queryOptions } from './lib/gdebenz-client.mjs';
+import {
+  isGdeBenzUnavailableError,
+  listStations,
+  queryOptions,
+} from './lib/gdebenz-client.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed } from './lib/http.mjs';
 
 export default async function handler(req) {
@@ -8,7 +12,10 @@ export default async function handler(req) {
   try {
     return jsonResponse(await listStations(queryOptions(url.searchParams)));
   } catch (error) {
-    return errorResponse(400, error.message || 'Station lookup failed');
+    return errorResponse(
+      isGdeBenzUnavailableError(error) ? 502 : 400,
+      error.message || 'Station lookup failed',
+    );
   }
 }
 
