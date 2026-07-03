@@ -10,6 +10,10 @@ import {
   createAccessChallenge,
   issueAccessToken,
 } from '../netlify/functions/lib/access-gate-store.mjs';
+import {
+  MemoryPresenceStore,
+  handlePresenceRequest,
+} from '../netlify/functions/lib/presence-store.mjs';
 
 const benzinStationsPayload = {
   stations: [
@@ -72,6 +76,23 @@ async function accessHeaders() {
       'x-nf-client-connection-ip': '198.51.100.10',
     },
   };
+}
+
+async function activatePresence({ store, headers, now, clientId, sessionId }) {
+  const response = await handlePresenceRequest(new Request('http://localhost/api/presence', {
+    method: 'POST',
+    headers: { ...headers, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      clientId,
+      sessionId,
+      sessionStartedAt: now,
+      handle: 'Benzin Tester',
+      avatar: '/avatars/benzin.png',
+      activity: 'voting',
+    }),
+  }), store, () => now);
+
+  assert.equal(response.status, 200);
 }
 
 describe('Netlify Benzin service routing', () => {
@@ -162,6 +183,18 @@ describe('Netlify Benzin service routing', () => {
       });
     }, async () => {
       const access = await accessHeaders();
+      const now = Date.now();
+      const presenceStore = new MemoryPresenceStore();
+      const queueStore = new MemoryPresenceStore();
+      const clientId = 'benzin-client';
+      const sessionId = 'benzin-session';
+      await activatePresence({
+        store: presenceStore,
+        headers: access.headers,
+        now,
+        clientId,
+        sessionId,
+      });
       const response = await handleVoteRequest(new Request('http://localhost/api/vote', {
         method: 'POST',
         headers: { ...access.headers, 'content-type': 'application/json' },
@@ -169,8 +202,18 @@ describe('Netlify Benzin service routing', () => {
           source: 'benzin',
           osm_ids: ['123'],
           vote_status: 'available',
+          clientId,
+          sessionId,
+          handle: 'Benzin Tester',
+          avatar: '/avatars/benzin.png',
         }),
-      }), { accessStore: access.store });
+      }), {
+        accessStore: access.store,
+        presenceStore,
+        queueStore,
+        nowFn: () => now,
+        sleep: async () => {},
+      });
       const body = await response.json();
 
       assert.equal(response.status, 200);
