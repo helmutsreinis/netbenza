@@ -1,0 +1,14 @@
+node_modules/
+__pycache__/
+*.py[cod]
+.Python
+.pytest_cache/
+.ruff_cache/
+.netlify/
+dist/
+build/
+*.log
+.env
+.env.*
+.DS_Store
+Thumbs.db

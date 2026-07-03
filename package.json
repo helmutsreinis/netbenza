@@ -1,0 +1,13 @@
+{
+  "name": "gdebenz-netlify",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "check:functions": "node scripts/check-functions.mjs"
+  },
+  "dependencies": {
+    "@netlify/blobs": "^9.1.0"
+  }
+}

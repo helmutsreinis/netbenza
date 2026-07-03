@@ -1,0 +1,11 @@
+[build]
+  command = "npm test"
+  publish = "gdebenz_ui/static"
+
+[functions]
+  directory = "netlify/functions"
+
+[[redirects]]
+  from = "/static/*"
+  to = "/:splat"
+  status = 200

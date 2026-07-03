@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GdeBenz Bulk Voter</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <span class="logo-g">Gde</span><span class="logo-b">BENZ</span>
+    <span class="logo-sub">Bulk Voter</span>
+  </div>
+  <div class="header-actions">
+    <div id="online-users" class="online-users" aria-live="polite"></div>
+    <button id="identity-reset" class="btn btn-sm btn-ghost identity-reset" type="button">Profile</button>
+    <span id="fp-indicator" class="badge" title="Current profile"></span>
+  </div>
+</header>
+
+<main>
+  <!-- Search Panel -->
+  <section class="panel search-panel">
+    <div class="search-row">
+      <div class="field">
+        <label>CITY (QUICK PICK)</label>
+        <select id="city-select">
+          <option value="">— select —</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>OR SEARCH CITY</label>
+        <input type="text" id="city-input" placeholder="Any Russian city..." autocomplete="off">
+        <div id="city-suggestions" class="suggestions"></div>
+      </div>
+      <div class="field">
+        <label>OR COORDINATES</label>
+        <div class="coord-row">
+          <input type="number" id="lat-input" placeholder="Latitude" step="0.01">
+          <input type="number" id="lon-input" placeholder="Longitude" step="0.01">
+        </div>
+      </div>
+      <div class="field field-sm">
+        <label>RADIUS, KM</label>
+        <input type="number" id="radius-input" value="20" min="1" max="100" step="1">
+      </div>
+      <button id="search-btn" class="btn btn-primary">🔍 Search</button>
+    </div>
+  </section>
+
+  <!-- Filters -->
+  <section class="panel filter-panel" id="filter-panel" style="display:none">
+    <div class="filter-row">
+      <div class="filter-group">
+        <span class="filter-label">Fuel:</span>
+        <div id="fuel-chips" class="chips"></div>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">Status:</span>
+        <div id="status-chips" class="chips"></div>
+      </div>
+      <div class="filter-group">
+        <span class="filter-label">Brand:</span>
+        <select id="brand-filter" class="input-sm">
+          <option value="">All brands</option>
+        </select>
+      </div>
+      <button id="apply-filters-btn" class="btn btn-sm">Apply</button>
+      <button id="select-all-btn" class="btn btn-sm btn-ghost">Select All</button>
+      <button id="deselect-all-btn" class="btn btn-sm btn-ghost">Clear</button>
+    </div>
+  </section>
+
+  <!-- Stats bar -->
+  <section class="stats-bar" id="stats-bar" style="display:none">
+    <div id="stats-summary"></div>
+    <div id="stats-selected"></div>
+  </section>
+
+  <!-- Pagination -->
+  <section class="pagination" id="pagination" style="display:none">
+    <button class="btn btn-sm btn-ghost" id="page-prev">◀ Prev</button>
+    <span class="page-info" id="page-info">Page 1 / 1</span>
+    <button class="btn btn-sm btn-ghost" id="page-next">Next ▶</button>
+    <span class="page-total" id="page-total"></span>
+  </section>
+
+  <!-- Station List -->
+  <section class="station-list" id="station-list"></section>
+
+  <!-- Pagination (bottom) -->
+  <section class="pagination" id="pagination-bot" style="display:none">
+    <button class="btn btn-sm btn-ghost" id="page-prev-bot">◀ Prev</button>
+    <span class="page-info" id="page-info-bot">Page 1 / 1</span>
+    <button class="btn btn-sm btn-ghost" id="page-next-bot">Next ▶</button>
+  </section>
+
+  <!-- Vote Panel -->
+  <section class="panel vote-panel" id="vote-panel" style="display:none">
+    <div class="vote-row">
+      <div class="field">
+        <label>New Status</label>
+        <select id="vote-status">
+          <option value="">— select —</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Comment Mode</label>
+        <select id="comment-mode">
+          <option value="custom">Custom text</option>
+          <option value="positive">🎲 Random Positive (RU)</option>
+          <option value="negative">🎲 Random Negative (RU)</option>
+        </select>
+      </div>
+      <div class="field flex-1" id="comment-text-field">
+        <label>Comment (Russian)</label>
+        <input type="text" id="vote-text" placeholder="Fuel is available...">
+      </div>
+      <label class="checkbox-label" title="Mark as 'on-site'">
+        <input type="checkbox" id="vote-onsite"> On-site
+      </label>
+      <button id="vote-btn" class="btn btn-accent" disabled>
+        🗳 Vote (<span id="vote-count">0</span>)
+      </button>
+    </div>
+  </section>
+
+  <!-- Progress Bar (visible only during voting) -->
+  <section class="progress-section" id="progress-bar" style="display:none">
+    <div class="progress-header">
+      <span class="progress-title">⏳ BULK VOTING IN PROGRESS</span>
+      <span class="progress-badge" id="progress-badge"></span>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-fill"></div>
+    </div>
+    <div class="progress-footer">
+      <span id="progress-text">0 / 0</span>
+      <span id="progress-pct">0%</span>
+    </div>
+    <div id="progress-current" class="progress-current"></div>
+  </section>
+
+  <!-- Results -->
+  <section id="results-area"></section>
+</main>
+
+<!-- Status toast -->
+<div id="toast" class="toast"></div>
+
+<!-- Identity gate -->
+<div id="identity-modal" class="identity-modal" hidden>
+  <form id="identity-form" class="identity-card">
+    <div class="identity-title">Choose your profile</div>
+    <div class="field">
+      <label>HANDLE OR NAME</label>
+      <input type="text" id="identity-handle" maxlength="32" placeholder="Your name" autocomplete="nickname" required>
+    </div>
+    <div class="field">
+      <label>AVATAR</label>
+      <div id="avatar-grid" class="avatar-grid"></div>
+    </div>
+    <button id="identity-save" class="btn btn-primary" type="submit">Enter</button>
+  </form>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
