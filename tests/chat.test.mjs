@@ -82,6 +82,12 @@ class FailingWriteStore extends MemoryPresenceStore {
   }
 }
 
+class IpLeakReadStore extends MemoryPresenceStore {
+  async get() {
+    throw new Error('198.51.100.88');
+  }
+}
+
 describe('chat store', () => {
   it('normalizeChatText trims, collapses, and clips text', () => {
     assert.equal(normalizeChatText('  hello\n\tthere   friend  '), 'hello there friend');
@@ -216,6 +222,50 @@ describe('Netlify chat route', () => {
     assert.equal(serialized.includes('/avatars/spoofed.png'), false);
     assert.equal(serialized.includes('client-supplied'), false);
     assert.equal(serialized.includes('session-one'), false);
+  });
+
+  it('POST stores canonical active presence identity when body ids need normalization', async () => {
+    const now = 2_250_000;
+    const access = await accessContext({ now, ip: '198.51.100.55' });
+    const presenceStore = new MemoryPresenceStore();
+    const chatStore = new MemoryPresenceStore();
+
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: ' client one ',
+      sessionId: ' tab:one / active ',
+      handle: 'Canonical Operator',
+      avatar: '/avatars/canonical.png',
+    });
+
+    const response = await handleChatRequest(new Request('https://site.test/api/chat', {
+      method: 'POST',
+      headers: { ...access.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: ' client one ',
+        sessionId: ' tab:one / active ',
+        text: 'canonical hello',
+      }),
+    }), {
+      accessStore: access.store,
+      presenceStore,
+      chatStore,
+      nowFn: () => now + 500,
+      id: 'canonical-chat',
+    });
+    const body = await response.json();
+    const state = await readChatState(chatStore);
+
+    assert.equal(response.status, 200);
+    assert.equal(body.messages[0].clientId, 'client-one');
+    assert.equal(body.messages[0].handle, 'Canonical Operator');
+    assert.equal(body.messages[0].avatar, '/avatars/canonical.png');
+    assert.equal(state.messages[0].clientId, 'client-one');
+    assert.equal(state.messages[0].sessionId, 'tab:one-active');
+    assert.equal(state.messages[0].handle, 'Canonical Operator');
+    assert.equal(state.messages[0].avatar, '/avatars/canonical.png');
   });
 
   it('POST stale session returns 409 and does not append', async () => {
@@ -354,5 +404,22 @@ describe('Netlify chat route', () => {
     assert.equal(readFailureBody.detail, 'blob_read_failed');
     assert.equal(writeFailureResponse.status, 503);
     assert.equal(writeFailureBody.detail, 'blob_write_failed');
+  });
+
+  it('storage errors do not leak arbitrary IP-like exception messages', async () => {
+    const now = 3_750_000;
+    const access = await accessContext({ now, ip: '198.51.100.56' });
+
+    const response = await handleChatRequest(new Request('https://site.test/api/chat', {
+      headers: access.headers,
+    }), {
+      accessStore: access.store,
+      chatStore: new IpLeakReadStore(),
+      nowFn: () => now,
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 503);
+    assert.equal(body.detail, 'chat_failed');
   });
 });

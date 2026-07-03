@@ -2,6 +2,7 @@ import { assertRequestAccess } from './lib/access-gate-store.mjs';
 import {
   assertActiveSession,
   getPresenceStore,
+  normalizeSessionId,
   presenceSnapshot,
 } from './lib/presence-store.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/http.mjs';
@@ -35,22 +36,41 @@ function chatIdentity(req, body = {}) {
   };
 }
 
+function normalizePresenceClientId(value) {
+  return String(value || '')
+    .trim()
+    .slice(0, 80)
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
 async function activeChatIdentity(req, body, options, now) {
   const identity = chatIdentity(req, body);
   const presenceStore = options.presenceStore || getPresenceStore();
   await assertActiveSession(presenceStore, identity, now);
   const snapshot = await presenceSnapshot(presenceStore, now, identity);
-  const activeUser = (snapshot.users || []).find((user) => user.clientId === identity.clientId);
+  const canonicalClientId = normalizePresenceClientId(identity.clientId);
+  const canonicalSessionId = normalizeSessionId(identity.sessionId);
+  const activeUser = (snapshot.users || []).find((user) => user.clientId === canonicalClientId);
   return {
-    ...identity,
+    clientId: activeUser?.clientId || canonicalClientId,
+    sessionId: canonicalSessionId,
+    ipKey: identity.ipKey,
     handle: activeUser?.handle || 'Anonymous',
     avatar: activeUser?.avatar || '',
   };
 }
 
+const SAFE_ROUTE_ERROR_DETAILS = new Set([
+  'blob_read_failed',
+  'blob_write_failed',
+  'chat_text_required',
+]);
+
 function safeRouteErrorDetail(error) {
-  const detail = String(error?.code || error?.message || 'chat_failed');
-  return /^[a-zA-Z0-9_.:-]{1,120}$/.test(detail) ? detail : 'chat_failed';
+  if (SAFE_ROUTE_ERROR_DETAILS.has(error?.code)) return error.code;
+  if (SAFE_ROUTE_ERROR_DETAILS.has(error?.message)) return error.message;
+  return 'chat_failed';
 }
 
 function chatRouteErrorResponse(error) {
