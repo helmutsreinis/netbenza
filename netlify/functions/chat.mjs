@@ -65,6 +65,10 @@ const SAFE_ROUTE_ERROR_DETAILS = new Set([
   'blob_read_failed',
   'blob_write_failed',
   'chat_text_required',
+  'client_replaced',
+  'invalid_session',
+  'ip_replaced',
+  'not_found',
 ]);
 
 function safeRouteErrorDetail(error) {
@@ -107,7 +111,7 @@ export async function handleChatRequest(req, options = {}) {
   try {
     identity = await activeChatIdentity(req, body, options, now);
   } catch (error) {
-    return errorResponse(error.status || 409, error.code || error.message || 'inactive_session');
+    return chatRouteErrorResponse(error);
   }
 
   try {

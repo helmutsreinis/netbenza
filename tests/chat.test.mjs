@@ -88,6 +88,12 @@ class IpLeakReadStore extends MemoryPresenceStore {
   }
 }
 
+class IpLeakPresenceStore extends MemoryPresenceStore {
+  async list() {
+    throw new Error('198.51.100.99');
+  }
+}
+
 describe('chat store', () => {
   it('normalizeChatText trims, collapses, and clips text', () => {
     assert.equal(normalizeChatText('  hello\n\tthere   friend  '), 'hello there friend');
@@ -421,5 +427,32 @@ describe('Netlify chat route', () => {
 
     assert.equal(response.status, 503);
     assert.equal(body.detail, 'chat_failed');
+  });
+
+  it('presence lookup errors do not leak arbitrary IP-like exception messages or append', async () => {
+    const now = 4_000_000;
+    const access = await accessContext({ now, ip: '198.51.100.57' });
+    const chatStore = new MemoryPresenceStore();
+
+    const response = await handleChatRequest(new Request('https://site.test/api/chat', {
+      method: 'POST',
+      headers: { ...access.headers, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        clientId: 'client-one',
+        sessionId: 'session-one',
+        text: 'do not append',
+      }),
+    }), {
+      accessStore: access.store,
+      presenceStore: new IpLeakPresenceStore(),
+      chatStore,
+      nowFn: () => now,
+    });
+    const body = await response.json();
+    const state = await readChatState(chatStore);
+
+    assert.equal(response.status, 503);
+    assert.equal(body.detail, 'chat_failed');
+    assert.deepEqual(state.messages, []);
   });
 });
