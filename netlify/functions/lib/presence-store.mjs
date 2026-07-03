@@ -2,6 +2,7 @@ import { getStore } from '@netlify/blobs';
 import { requestIpKey } from './request-context.mjs';
 
 export const ACTIVE_WINDOW_MS = 25_000;
+export const SESSION_STARTED_AT_FUTURE_TOLERANCE_MS = 120_000;
 
 const ALLOWED_ACTIVITIES = new Set([
   'online',
@@ -33,15 +34,18 @@ export function normalizeSessionId(value) {
   return normalized;
 }
 
-export function normalizeSessionStartedAt(value) {
+export function normalizeSessionStartedAt(value, now = Date.now()) {
   const normalized = Math.trunc(Number(value));
   if (!Number.isFinite(normalized) || normalized <= 0) {
     throw new Error('sessionStartedAt is required');
   }
+  if (normalized > now + SESSION_STARTED_AT_FUTURE_TOLERANCE_MS) {
+    throw new Error('sessionStartedAt is too far in the future');
+  }
   return normalized;
 }
 
-export function normalizePresenceBody(body = {}) {
+export function normalizePresenceBody(body = {}, now = Date.now()) {
   const activity = ALLOWED_ACTIVITIES.has(body.activity) ? body.activity : 'online';
   const avatar = clip(body.avatar, 240);
   const detail = typeof body.detail === 'string' ? body.detail : '';
@@ -49,7 +53,7 @@ export function normalizePresenceBody(body = {}) {
   return {
     clientId: normalizeClientId(body.clientId),
     sessionId: normalizeSessionId(body.sessionId),
-    sessionStartedAt: normalizeSessionStartedAt(body.sessionStartedAt),
+    sessionStartedAt: normalizeSessionStartedAt(body.sessionStartedAt, now),
     handle: clip(body.handle, 32) || 'Anonymous',
     avatar: avatar.startsWith('/avatars/') || avatar.startsWith('/static/avatars/') ? avatar : '',
     activity,
@@ -61,12 +65,13 @@ export function createPresenceRecord(normalized, now = Date.now()) {
   return {
     clientId: normalizeClientId(normalized.clientId),
     sessionId: normalizeSessionId(normalized.sessionId),
-    sessionStartedAt: normalizeSessionStartedAt(normalized.sessionStartedAt),
+    sessionStartedAt: normalizeSessionStartedAt(normalized.sessionStartedAt, now),
     handle: normalized.handle,
     avatar: normalized.avatar,
     activity: normalized.activity,
     detail: normalized.detail,
     ipKey: normalized.ipKey || '',
+    acceptedAt: Math.max(0, Math.trunc(Number(normalized.acceptedAt || now)) || now),
     lastSeen: now,
     endedAt: Math.max(0, Math.trunc(Number(normalized.endedAt || 0)) || 0),
   };
@@ -136,11 +141,11 @@ function isRecordActive(record, now) {
   return !record?.endedAt && isRecordRecent(record, now);
 }
 
-function normalizeRecordIdentity(record) {
+function normalizeRecordIdentity(record, now = Date.now()) {
   try {
     const clientId = normalizeClientId(record?.clientId);
     const sessionId = normalizeSessionId(record?.sessionId);
-    const sessionStartedAt = normalizeSessionStartedAt(record?.sessionStartedAt);
+    const sessionStartedAt = normalizeSessionStartedAt(record?.sessionStartedAt, now);
     const ipKey = typeof record?.ipKey === 'string' ? record.ipKey : '';
     if (!ipKey) return null;
     return {
@@ -148,7 +153,7 @@ function normalizeRecordIdentity(record) {
       sessionId,
       sessionStartedAt,
       ipKey,
-      lastSeen: Math.trunc(Number(record.lastSeen || 0)) || 0,
+      acceptedAt: Math.trunc(Number(record.acceptedAt || 0)) || 0,
       endedAt: Math.trunc(Number(record.endedAt || 0)) || 0,
     };
   } catch {
@@ -174,8 +179,8 @@ function compareGeneration(left, right) {
   if (left.sessionStartedAt !== right.sessionStartedAt) {
     return left.sessionStartedAt - right.sessionStartedAt;
   }
-  if ((left.lastSeen || 0) !== (right.lastSeen || 0)) {
-    return (left.lastSeen || 0) - (right.lastSeen || 0);
+  if ((left.acceptedAt || 0) !== (right.acceptedAt || 0)) {
+    return (left.acceptedAt || 0) - (right.acceptedAt || 0);
   }
   const sessionCompare = String(left.sessionId).localeCompare(String(right.sessionId));
   if (sessionCompare) return sessionCompare;
@@ -190,7 +195,8 @@ function sameGeneration(left, right) {
     right?.sessionId &&
     left.clientId === right.clientId &&
     left.sessionId === right.sessionId &&
-    Number(left.sessionStartedAt) === Number(right.sessionStartedAt),
+    Number(left.sessionStartedAt) === Number(right.sessionStartedAt) &&
+    Number(left.acceptedAt || 0) === Number(right.acceptedAt || 0),
   );
 }
 
@@ -198,32 +204,44 @@ function newerGeneration(current, candidate) {
   return compareGeneration(candidate, current) > 0 ? candidate : current;
 }
 
-function clientStateGeneration(state) {
+function normalizedStartedAt(value, now) {
+  try {
+    return normalizeSessionStartedAt(value, now);
+  } catch {
+    return null;
+  }
+}
+
+function clientStateGeneration(state, now = Date.now()) {
   if (!state?.latestSessionId || !state?.latestStartedAt) return null;
+  const sessionStartedAt = normalizedStartedAt(state.latestStartedAt, now);
+  if (!sessionStartedAt) return null;
   return {
     clientId: state.clientId,
     sessionId: state.latestSessionId,
-    sessionStartedAt: Math.trunc(Number(state.latestStartedAt)) || 0,
-    lastSeen: Math.trunc(Number(state.updatedAt || state.endedAt || 0)) || 0,
+    sessionStartedAt,
+    acceptedAt: Math.trunc(Number(state.latestAcceptedAt || 0)) || 0,
     endedAt: Math.trunc(Number(state.endedAt || 0)) || 0,
   };
 }
 
-function ipStateGeneration(state) {
+function ipStateGeneration(state, now = Date.now()) {
   if (!state?.latestClientId || !state?.latestSessionId || !state?.latestStartedAt) return null;
+  const sessionStartedAt = normalizedStartedAt(state.latestStartedAt, now);
+  if (!sessionStartedAt) return null;
   return {
     clientId: state.latestClientId,
     sessionId: state.latestSessionId,
-    sessionStartedAt: Math.trunc(Number(state.latestStartedAt)) || 0,
-    lastSeen: Math.trunc(Number(state.updatedAt || state.endedAt || 0)) || 0,
+    sessionStartedAt,
+    acceptedAt: Math.trunc(Number(state.latestAcceptedAt || 0)) || 0,
     endedAt: Math.trunc(Number(state.endedAt || 0)) || 0,
   };
 }
 
-function endedStateMatchesRecord(state, recordIdentity) {
+function endedStateMatchesRecord(state, recordIdentity, now) {
   const stateIdentity = state?.latestClientId
-    ? ipStateGeneration(state)
-    : clientStateGeneration(state);
+    ? ipStateGeneration(state, now)
+    : clientStateGeneration(state, now);
   return Boolean(stateIdentity?.endedAt && sameGeneration(stateIdentity, recordIdentity));
 }
 
@@ -245,7 +263,7 @@ async function readSessionEntries(store, now) {
   const records = await listJsonRecords(store, 'users/');
 
   await Promise.all(records.map(async ({ key, record }) => {
-    const identity = normalizeRecordIdentity(record);
+    const identity = normalizeRecordIdentity(record, now);
     if (!identity) return;
     if (!record.endedAt && !isRecordRecent(record, now)) {
       await store.delete(key).catch(() => {});
@@ -281,12 +299,12 @@ async function derivePresenceState(store, now) {
   const ipWinners = new Map();
 
   for (const state of clientStates.values()) {
-    const identity = clientStateGeneration(state);
+    const identity = clientStateGeneration(state, now);
     if (identity) chooseWinner(clientWinners, identity.clientId, identity);
   }
 
   for (const state of ipStates.values()) {
-    const identity = ipStateGeneration(state);
+    const identity = ipStateGeneration(state, now);
     if (identity) chooseWinner(ipWinners, state.ipKey, identity);
   }
 
@@ -299,8 +317,8 @@ async function derivePresenceState(store, now) {
     if (!isRecordActive(record, now)) return false;
     if (!sameGeneration(clientWinners.get(identity.clientId), identity)) return false;
     if (!sameGeneration(ipWinners.get(identity.ipKey), identity)) return false;
-    if (endedStateMatchesRecord(clientStates.get(identity.clientId), identity)) return false;
-    if (endedStateMatchesRecord(ipStates.get(identity.ipKey), identity)) return false;
+    if (endedStateMatchesRecord(clientStates.get(identity.clientId), identity, now)) return false;
+    if (endedStateMatchesRecord(ipStates.get(identity.ipKey), identity, now)) return false;
     return true;
   });
 
@@ -402,13 +420,13 @@ function identityFromRecord(record) {
     sessionId: record.sessionId,
     sessionStartedAt: record.sessionStartedAt,
     ipKey: record.ipKey,
-    lastSeen: record.lastSeen,
+    acceptedAt: record.acceptedAt,
   };
 }
 
 function shouldWriteClientState(state, record, keepEnded) {
   const incoming = identityFromRecord(record);
-  const current = clientStateGeneration(state);
+  const current = clientStateGeneration(state, record.lastSeen);
   if (!current) return true;
   if (state.endedAt && sameGeneration(current, incoming)) return false;
   if (keepEnded) return false;
@@ -417,7 +435,7 @@ function shouldWriteClientState(state, record, keepEnded) {
 
 function shouldWriteIpState(state, record, keepEnded) {
   const incoming = identityFromRecord(record);
-  const current = ipStateGeneration(state);
+  const current = ipStateGeneration(state, record.lastSeen);
   if (!current) return true;
   if (state.endedAt && sameGeneration(current, incoming)) return false;
   if (keepEnded) return false;
@@ -436,6 +454,7 @@ async function writeHighWatermarks(store, record, keepEnded) {
       clientId: record.clientId,
       latestSessionId: record.sessionId,
       latestStartedAt: record.sessionStartedAt,
+      latestAcceptedAt: record.acceptedAt,
       updatedAt: record.lastSeen,
       endedAt: 0,
     }));
@@ -447,6 +466,7 @@ async function writeHighWatermarks(store, record, keepEnded) {
       latestClientId: record.clientId,
       latestSessionId: record.sessionId,
       latestStartedAt: record.sessionStartedAt,
+      latestAcceptedAt: record.acceptedAt,
       updatedAt: record.lastSeen,
       endedAt: 0,
     }));
@@ -459,9 +479,11 @@ async function applyPresencePost(store, identity, now) {
   const key = presenceKey(identity.clientId, identity.sessionId);
   const existing = await readStoreJson(store, key);
   const existingStartedAt = Math.trunc(Number(existing?.sessionStartedAt || 0)) || 0;
+  const existingAcceptedAt = Math.trunc(Number(existing?.acceptedAt || 0)) || 0;
   const keepEnded = Boolean(existing?.endedAt && existingStartedAt >= identity.sessionStartedAt);
   const record = createPresenceRecord({
     ...identity,
+    acceptedAt: existingAcceptedAt || now,
     endedAt: keepEnded ? existing.endedAt : 0,
   }, now);
 
@@ -482,6 +504,7 @@ async function markActiveSessionEnded(store, identity, now) {
       clientId: identity.clientId,
       latestSessionId: record.sessionId,
       latestStartedAt: record.sessionStartedAt,
+      latestAcceptedAt: record.acceptedAt,
       updatedAt: now,
       endedAt: now,
     }),
@@ -490,6 +513,7 @@ async function markActiveSessionEnded(store, identity, now) {
       latestClientId: record.clientId,
       latestSessionId: record.sessionId,
       latestStartedAt: record.sessionStartedAt,
+      latestAcceptedAt: record.acceptedAt,
       updatedAt: now,
       endedAt: now,
     }),
@@ -516,7 +540,7 @@ export async function handlePresenceRequest(req, store = getPresenceStore(), now
 
   if (req.method === 'POST') {
     try {
-      const normalized = normalizePresenceBody(await readJson(req));
+      const normalized = normalizePresenceBody(await readJson(req), now);
       const identity = { ...normalized, ipKey: requestIpKey(req) };
       await applyPresencePost(store, identity, now);
       return json(await presenceSnapshot(store, now, identity));
