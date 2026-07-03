@@ -5,6 +5,11 @@ import configHandler from '../netlify/functions/config.mjs';
 import stationIdsHandler from '../netlify/functions/station-ids.mjs';
 import stationsHandler from '../netlify/functions/stations.mjs';
 import voteHandler from '../netlify/functions/vote.mjs';
+import {
+  MemoryAccessGateStore,
+  createAccessChallenge,
+  issueAccessToken,
+} from '../netlify/functions/lib/access-gate-store.mjs';
 
 const benzinStationsPayload = {
   stations: [
@@ -45,12 +50,37 @@ function withMockFetch(mock, run) {
     });
 }
 
+function correctAnswers(challenge) {
+  return Object.fromEntries(challenge.questions.map((question) => [question.id, question.correct]));
+}
+
+async function accessHeaders() {
+  const store = new MemoryAccessGateStore();
+  const challenge = await createAccessChallenge(store);
+  const accessSessionId = `test-session-${crypto.randomUUID()}`;
+  const { accessToken } = await issueAccessToken(store, {
+    challengeId: challenge.challengeId,
+    answers: correctAnswers(challenge),
+    accessSessionId,
+    ipKey: 'ip:198.51.100.10',
+  });
+  return {
+    store,
+    headers: {
+      'x-access-token': accessToken,
+      'x-access-session': accessSessionId,
+      'x-nf-client-connection-ip': '198.51.100.10',
+    },
+  };
+}
+
 describe('Netlify Benzin service routing', () => {
   it('returns Benzin-specific config for source=benzin', async () => {
+    const access = await accessHeaders();
     const response = await configHandler(new Request(
       'http://localhost/api/config?source=benzin',
-      { method: 'GET' },
-    ));
+      { method: 'GET', headers: access.headers },
+    ), access.store);
     const body = await response.json();
 
     assert.equal(response.status, 200);
@@ -69,10 +99,11 @@ describe('Netlify Benzin service routing', () => {
         headers: { 'content-type': 'application/json' },
       });
     }, async () => {
+      const access = await accessHeaders();
       const response = await stationsHandler(new Request(
         'http://localhost/api/stations?source=benzin&lat=55.75&lon=37.62&limit=1',
-        { method: 'GET' },
-      ));
+        { method: 'GET', headers: access.headers },
+      ), access.store);
       const body = await response.json();
 
       assert.equal(response.status, 200);
@@ -92,10 +123,11 @@ describe('Netlify Benzin service routing', () => {
       status: 200,
       headers: { 'content-type': 'application/json' },
     }), async () => {
+      const access = await accessHeaders();
       const response = await stationIdsHandler(new Request(
         'http://localhost/api/stations/ids?source=benzin&lat=55.75&lon=37.62&status=available',
-        { method: 'GET' },
-      ));
+        { method: 'GET', headers: access.headers },
+      ), access.store);
       const body = await response.json();
 
       assert.equal(response.status, 200);
@@ -115,14 +147,16 @@ describe('Netlify Benzin service routing', () => {
         headers: { 'content-type': 'application/json' },
       });
     }, async () => {
+      const access = await accessHeaders();
       const response = await voteHandler(new Request('http://localhost/api/vote', {
         method: 'POST',
+        headers: { ...access.headers, 'content-type': 'application/json' },
         body: JSON.stringify({
           source: 'benzin',
           osm_ids: ['123'],
           vote_status: 'available',
         }),
-      }));
+      }), access.store);
       const body = await response.json();
 
       assert.equal(response.status, 200);

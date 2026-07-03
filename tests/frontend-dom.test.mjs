@@ -5,9 +5,37 @@ import { describe, it } from 'node:test';
 
 import { JSDOM } from 'jsdom';
 
-function loadFrontendHarness() {
+function loadFrontendHarness(options = {}) {
+  const fetchLog = [];
+  const defaultConfigResponse = {
+    fuel_grades: ['92', '95'],
+    statuses: [{ value: 'yes', label: 'Yes', color: 'green' }],
+    cities: [],
+    brands: [],
+  };
+  const fetchImpl = options.fetch || (async (url, fetchOptions = {}) => {
+    fetchLog.push({ url: String(url), options: fetchOptions });
+    return { ok: true, json: async () => options.configResponse || defaultConfigResponse };
+  });
   const dom = new JSDOM(`
     <!doctype html>
+    <div id="access-gate-modal" hidden>
+      <form id="access-gate-form">
+        <div id="access-question-list"></div>
+        <div id="access-gate-error" hidden></div>
+        <button id="access-submit" type="submit">Enter</button>
+      </form>
+    </div>
+    <div id="identity-modal" hidden>
+      <form id="identity-form">
+        <input id="identity-handle">
+        <div id="avatar-grid"></div>
+      </form>
+    </div>
+    <button id="identity-reset" type="button"></button>
+    <span id="fp-indicator"></span>
+    <div id="online-users"></div>
+    <div id="toast"></div>
     <button id="vote-selected-btn">Vote Selected (<span id="vote-sel-count">0</span>)</button>
     <button id="vote-btn">Vote ALL (<span id="vote-all-count">0</span> filtered)</button>
     <select id="vote-status"><option value=""></option><option value="yes">yes</option></select>
@@ -32,12 +60,6 @@ function loadFrontendHarness() {
     </section>
     <section id="gdebenz-service" hidden></section>
   `, { url: 'http://localhost/' });
-  const configResponse = {
-    fuel_grades: ['92', '95'],
-    statuses: [{ value: 'yes', label: 'Yes', color: 'green' }],
-    cities: [],
-    brands: [],
-  };
   const source = readFileSync('gdebenz_ui/static/app.js', 'utf8').replace(/\ninit\(\);\s*$/, '\n');
   const context = vm.createContext({
     clearInterval,
@@ -45,9 +67,10 @@ function loadFrontendHarness() {
     console,
     crypto,
     document: dom.window.document,
-    fetch: async () => ({ ok: true, json: async () => configResponse }),
+    fetch: fetchImpl,
     Headers,
     localStorage: dom.window.localStorage,
+    sessionStorage: dom.window.sessionStorage,
     setInterval,
     setTimeout,
     URLSearchParams,
@@ -55,10 +78,139 @@ function loadFrontendHarness() {
   });
 
   vm.runInContext(source, context);
-  return { context, dom };
+  return { context, dom, fetchLog };
 }
 
 describe('frontend DOM updates', () => {
+  it('renders server-provided access questions and answer order', () => {
+    const { context, dom } = loadFrontendHarness();
+
+    vm.runInContext(`
+      state.accessChallenge = {
+        challengeId: 'challenge-1',
+        questions: [
+          {
+            id: 'crimea',
+            prompt: 'Is Crimea part of Ukraine?',
+            answers: [{ label: 'No', value: false }, { label: 'Yes', value: true }]
+          },
+          {
+            id: 'riga',
+            prompt: 'Is Riga the capital of Latvia?',
+            answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }]
+          },
+          {
+            id: 'baltic',
+            prompt: 'Does Ukraine border the Baltic Sea?',
+            answers: [{ label: 'No', value: false }, { label: 'Yes', value: true }]
+          }
+        ]
+      };
+      renderAccessGate();
+    `, context);
+
+    const questions = [...dom.window.document.querySelectorAll('.access-question')];
+    assert.equal(questions.length, 3);
+    assert.match(questions[0].textContent || '', /Is Crimea part of Ukraine/);
+    assert.deepEqual(
+      [...questions[0].querySelectorAll('input')].map((input) => input.value),
+      ['false', 'true'],
+    );
+    assert.equal(dom.window.document.getElementById('access-gate-modal')?.hidden, false);
+  });
+
+  it('stores access token and session id after a correct questionnaire submit', async () => {
+    const posts = [];
+    const challenge = {
+      challengeId: 'challenge-ok',
+      questions: [
+        { id: 'crimea', prompt: 'Is Crimea part of Ukraine?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+        { id: 'riga', prompt: 'Is Riga the capital of Latvia?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+        { id: 'baltic', prompt: 'Does Ukraine border the Baltic Sea?', answers: [{ label: 'No', value: false }, { label: 'Yes', value: true }] },
+      ],
+    };
+    const { context, dom } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        if (String(url) === '/api/access-token' && options.method === 'POST') {
+          posts.push(JSON.parse(options.body));
+          return { ok: true, json: async () => ({ accessToken: 'access-token-ok', expiresAt: 123 }) };
+        }
+        if (String(url) === '/api/access-token') return { ok: true, json: async () => challenge };
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    await vm.runInContext('initAccessGate()', context);
+    dom.window.document.querySelector('input[name="access-crimea"][value="true"]').checked = true;
+    dom.window.document.querySelector('input[name="access-riga"][value="true"]').checked = true;
+    dom.window.document.querySelector('input[name="access-baltic"][value="false"]').checked = true;
+    await vm.runInContext('submitAccessGate(new window.Event("submit"))', context);
+
+    assert.equal(dom.window.sessionStorage.getItem('gdebenz.accessToken.v1'), 'access-token-ok');
+    assert.equal(Boolean(dom.window.sessionStorage.getItem('gdebenz.accessSession.v1')), true);
+    assert.equal(dom.window.document.getElementById('access-gate-modal')?.hidden, true);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(posts[0].answers, { crimea: true, riga: true, baltic: false });
+    assert.equal(posts[0].challengeId, 'challenge-ok');
+    assert.equal(posts[0].accessSessionId, dom.window.sessionStorage.getItem('gdebenz.accessSession.v1'));
+  });
+
+  it('shows retry state and fetches a fresh challenge after an incorrect submit', async () => {
+    let challengeCount = 0;
+    const challenges = [
+      {
+        challengeId: 'challenge-bad',
+        questions: [
+          { id: 'latvia-sea', prompt: 'Does Latvia border the Baltic Sea?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+          { id: 'riga', prompt: 'Is Riga the capital of Latvia?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+          { id: 'crimea', prompt: 'Is Crimea part of Ukraine?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+        ],
+      },
+      {
+        challengeId: 'challenge-retry',
+        questions: [
+          { id: 'crimea', prompt: 'Is Crimea part of Ukraine?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+          { id: 'riga', prompt: 'Is Riga the capital of Latvia?', answers: [{ label: 'Yes', value: true }, { label: 'No', value: false }] },
+          { id: 'baltic', prompt: 'Does Ukraine border the Baltic Sea?', answers: [{ label: 'No', value: false }, { label: 'Yes', value: true }] },
+        ],
+      },
+    ];
+    const { context, dom } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        if (String(url) === '/api/access-token' && options.method === 'POST') {
+          return { ok: false, status: 401, json: async () => ({ detail: 'access_answers_invalid' }) };
+        }
+        if (String(url) === '/api/access-token') {
+          return { ok: true, json: async () => challenges[challengeCount++] };
+        }
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    await vm.runInContext('initAccessGate()', context);
+    dom.window.document.querySelector('input[name="access-latvia-sea"][value="true"]').checked = true;
+    dom.window.document.querySelector('input[name="access-riga"][value="true"]').checked = true;
+    dom.window.document.querySelector('input[name="access-crimea"][value="true"]').checked = true;
+    await vm.runInContext('submitAccessGate(new window.Event("submit"))', context);
+
+    assert.equal(dom.window.document.getElementById('access-gate-modal')?.hidden, false);
+    assert.equal(dom.window.document.getElementById('access-gate-error')?.hidden, false);
+    assert.match(dom.window.document.getElementById('access-gate-error')?.textContent || '', /Try again/i);
+    assert.match(dom.window.document.getElementById('access-question-list')?.textContent || '', /Does Ukraine border the Baltic Sea/);
+    assert.equal(challengeCount, 2);
+  });
+
+  it('adds access token and session headers to API calls', async () => {
+    const { context, dom, fetchLog } = loadFrontendHarness();
+    dom.window.sessionStorage.setItem('gdebenz.accessToken.v1', 'token-123');
+    dom.window.sessionStorage.setItem('gdebenz.accessSession.v1', 'session-123');
+
+    await vm.runInContext('api("/api/config")', context);
+
+    assert.equal(fetchLog[0].options.headers['x-access-token'], 'token-123');
+    assert.equal(fetchLog[0].options.headers['x-access-session'], 'session-123');
+  });
+
   it('keeps split vote counters after updating vote button state', () => {
     const { context, dom } = loadFrontendHarness();
 

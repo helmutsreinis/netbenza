@@ -1,9 +1,15 @@
 import { STATUSES, resolveCoords, submitVote } from './lib/gdebenz-client.mjs';
 import { BENZIN_STATUSES, submitBenzinReport } from './lib/benzin-client.mjs';
+import { assertRequestAccess, getAccessGateStore } from './lib/access-gate-store.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/http.mjs';
 
-export default async function handler(req) {
+export default async function handler(req, accessStore = getAccessGateStore()) {
   if (req.method !== 'POST') return methodNotAllowed(['POST']);
+  try {
+    await assertRequestAccess(req, accessStore);
+  } catch (error) {
+    return errorResponse(error.status || 401, error.code || error.message || 'access_denied');
+  }
   const body = await readJson(req);
   const source = body.source || 'gdebenz';
 

@@ -194,6 +194,20 @@
 <!-- Status toast -->
 <div id="toast" class="toast"></div>
 
+<!-- Access gate -->
+<div id="access-gate-modal" class="access-gate-modal" hidden>
+  <form id="access-gate-form" class="access-gate-card">
+    <div class="access-gate-kicker">Riga / Kyiv checkpoint</div>
+    <div class="access-gate-title">Latvia stands with Ukraine</div>
+    <p class="access-gate-copy">
+      Answer three quick solidarity checks before choosing a profile.
+    </p>
+    <div id="access-question-list" class="access-question-list"></div>
+    <div id="access-gate-error" class="access-gate-error" hidden></div>
+    <button id="access-submit" class="btn btn-primary access-submit" type="submit">Enter</button>
+  </form>
+</div>
+
 <!-- Identity gate -->
 <div id="identity-modal" class="identity-modal" hidden>
   <form id="identity-form" class="identity-card">

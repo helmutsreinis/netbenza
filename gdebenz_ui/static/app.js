@@ -5,6 +5,8 @@ const $ = (sel, ctx = document) => ctx.querySelector(sel);
 const $$ = (sel, ctx = document) => [...ctx.querySelectorAll(sel)];
 
 const PAGE_SIZE = 20;
+const ACCESS_TOKEN_KEY = 'gdebenz.accessToken.v1';
+const ACCESS_SESSION_KEY = 'gdebenz.accessSession.v1';
 const IDENTITY_KEY = 'gdebenz.identity.v1';
 const PRESENCE_HEARTBEAT_MS = 5000;
 const PRESENCE_POLL_MS = 4000;
@@ -51,6 +53,9 @@ const FALLBACK_AVATAR_FILES = [
 
 // ── State ──────────────────────────────────────────
 const state = {
+  accessChallenge: null,
+  accessSessionId: '',
+  identityGateInitialized: false,
   config: null,
   avatars: [],
   identity: null,
@@ -79,37 +84,52 @@ const state = {
 };
 
 // ── API helpers ────────────────────────────────────
+function accessHeaders() {
+  const accessToken = sessionStorage.getItem(ACCESS_TOKEN_KEY) || '';
+  const accessSessionId = state.accessSessionId || sessionStorage.getItem(ACCESS_SESSION_KEY) || '';
+  const headers = {};
+  if (accessToken) headers['x-access-token'] = accessToken;
+  if (accessSessionId) headers['x-access-session'] = accessSessionId;
+  return headers;
+}
+
+function normalizeHeaders(headers = {}) {
+  const normalized = {};
+  new Headers(headers).forEach((value, key) => {
+    normalized[key] = value;
+  });
+  return normalized;
+}
+
 async function api(path, opts = {}) {
+  const headers = {
+    'Content-Type': 'application/json',
+    ...accessHeaders(),
+    ...normalizeHeaders(opts.headers || {}),
+  };
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', ...opts.headers },
     ...opts,
+    headers,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail || res.statusText);
+    const error = new Error(err.detail || res.statusText);
+    if (res.status === 401) {
+      error.accessDenied = true;
+      await showAccessGateAfterDenied();
+    }
+    throw error;
   }
   return res.json();
 }
 
 // ── Init ───────────────────────────────────────────
 async function init() {
-  try {
-    state.config = await api('/api/config');
-    renderFuelChips();
-    renderStatusChips();
-    renderVoteStatusOptions();
-    renderCitySelect();
-    renderBrandSelect();
-  } catch (e) {
-    toast('Config load error: ' + e.message);
-  }
-
   // Add source to all future API calls
   state.source = 'gdebenz';
 
-  // City dropdown → auto search
   initServiceLauncher();
-  initIdentityGate();
+  initAccessGate();
 
   // City dropdown → auto search
   $('#city-select').addEventListener('change', () => {
@@ -170,12 +190,164 @@ async function init() {
   window.addEventListener('pagehide', leavePresence);
 }
 
+// ── Access Gate ────────────────────────────────────
+async function initAccessGate() {
+  const form = $('#access-gate-form');
+  if (form && form.dataset.boundAccessGate !== 'true') {
+    form.dataset.boundAccessGate = 'true';
+    form.addEventListener('submit', submitAccessGate);
+  }
+
+  state.accessSessionId = sessionStorage.getItem(ACCESS_SESSION_KEY) || randomId();
+  sessionStorage.setItem(ACCESS_SESSION_KEY, state.accessSessionId);
+
+  if (sessionStorage.getItem(ACCESS_TOKEN_KEY) && state.accessSessionId) {
+    const modal = $('#access-gate-modal');
+    if (modal) modal.hidden = true;
+    await loadInitialApp();
+    return;
+  }
+
+  await fetchAccessChallenge();
+}
+
+async function fetchAccessChallenge(message = '') {
+  const modal = $('#access-gate-modal');
+  const error = $('#access-gate-error');
+  const submit = $('#access-submit');
+  if (modal) modal.hidden = false;
+  if (submit) submit.disabled = true;
+  if (error) {
+    error.hidden = !message;
+    error.textContent = message;
+  }
+
+  try {
+    const res = await fetch('/api/access-token');
+    if (!res.ok) throw new Error('Access challenge unavailable');
+    state.accessChallenge = await res.json();
+    renderAccessGate(message);
+  } catch (e) {
+    if (error) {
+      error.hidden = false;
+      error.textContent = e.message || 'Access challenge unavailable';
+    }
+  } finally {
+    if (submit) submit.disabled = false;
+  }
+}
+
+function renderAccessGate(message = '') {
+  const modal = $('#access-gate-modal');
+  const list = $('#access-question-list');
+  const error = $('#access-gate-error');
+  if (!modal || !list) return;
+  modal.hidden = false;
+  if (error) {
+    error.hidden = !message;
+    error.textContent = message;
+  }
+
+  const questions = state.accessChallenge?.questions || [];
+  list.innerHTML = questions.map((question, index) => `
+    <fieldset class="access-question">
+      <legend>${index + 1}. ${esc(question.prompt)}</legend>
+      <div class="access-answer-row">
+        ${(question.answers || []).map((answer) => `
+          <label class="access-answer">
+            <input type="radio" name="access-${esc(question.id)}" value="${String(answer.value)}" required>
+            <span>${esc(answer.label)}</span>
+          </label>
+        `).join('')}
+      </div>
+    </fieldset>
+  `).join('');
+}
+
+async function submitAccessGate(event) {
+  event.preventDefault();
+  const questions = state.accessChallenge?.questions || [];
+  const answers = {};
+  const error = $('#access-gate-error');
+  const submit = $('#access-submit');
+
+  for (const question of questions) {
+    const checked = document.querySelector(`input[name="access-${question.id}"]:checked`);
+    if (!checked) {
+      if (error) {
+        error.hidden = false;
+        error.textContent = 'Answer all three checkpoint questions.';
+      }
+      return;
+    }
+    answers[question.id] = checked.value === 'true';
+  }
+
+  if (submit) submit.disabled = true;
+  try {
+    const res = await fetch('/api/access-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        challengeId: state.accessChallenge?.challengeId,
+        answers,
+        accessSessionId: state.accessSessionId,
+      }),
+    });
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: 'access_denied' }));
+      throw new Error(detail.detail || 'access_denied');
+    }
+    const data = await res.json();
+    sessionStorage.setItem(ACCESS_TOKEN_KEY, data.accessToken);
+    sessionStorage.setItem(ACCESS_SESSION_KEY, state.accessSessionId);
+    $('#access-gate-modal').hidden = true;
+    await loadInitialApp();
+  } catch {
+    sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+    await fetchAccessChallenge('Try again: one or more answers missed the checkpoint.');
+  } finally {
+    if (submit) submit.disabled = false;
+  }
+}
+
+async function showAccessGateAfterDenied() {
+  sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  stopPresenceTimers();
+  const identityModal = $('#identity-modal');
+  if (identityModal) identityModal.hidden = true;
+  await fetchAccessChallenge('Access expired. Try the checkpoint again.');
+}
+
+async function loadInitialApp() {
+  try {
+    state.config = await api('/api/config');
+    renderFuelChips();
+    renderStatusChips();
+    renderVoteStatusOptions();
+    renderCitySelect();
+    renderBrandSelect();
+  } catch (e) {
+    if (e.accessDenied) return;
+    toast('Config load error: ' + e.message);
+  }
+
+  try {
+    await loadAvatars();
+  } catch (e) {
+    if (e.accessDenied) return;
+    toast('Avatar load error: ' + e.message);
+  }
+  initIdentityGate();
+}
+
 // ── Identity & Presence ────────────────────────────
 async function loadAvatars() {
   try {
     const data = await api('/api/avatars');
     state.avatars = Array.isArray(data.avatars) ? data.avatars : [];
-  } catch {
+  } catch (e) {
+    if (e.accessDenied) throw e;
     state.avatars = FALLBACK_AVATAR_FILES.map((file, index) => ({
       id: `avatar-${index + 1}`,
       file,
@@ -191,13 +363,16 @@ function initIdentityGate() {
   renderIdentityBadge();
   renderOnlineUsers([]);
 
-  $('#identity-form').addEventListener('submit', saveIdentity);
-  $('#identity-reset').addEventListener('click', () => {
-    state.pendingAvatar = state.identity?.avatar || state.avatars[0]?.url || '';
-    $('#identity-handle').value = state.identity?.handle || '';
-    renderAvatarGrid();
-    showIdentityModal();
-  });
+  if (!state.identityGateInitialized) {
+    $('#identity-form').addEventListener('submit', saveIdentity);
+    $('#identity-reset').addEventListener('click', () => {
+      state.pendingAvatar = state.identity?.avatar || state.avatars[0]?.url || '';
+      $('#identity-handle').value = state.identity?.handle || '';
+      renderAvatarGrid();
+      showIdentityModal();
+    });
+    state.identityGateInitialized = true;
+  }
 
   if (state.identity) {
     $('#identity-modal').hidden = true;
@@ -443,6 +618,7 @@ function leavePresence() {
   if (!state.identity) return;
   fetch(`/api/presence?clientId=${encodeURIComponent(state.identity.clientId)}`, {
     method: 'DELETE',
+    headers: accessHeaders(),
     keepalive: true,
   }).catch(() => {});
 }
