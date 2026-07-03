@@ -29,9 +29,10 @@ function currentNow(options, nowFn) {
 }
 
 function chatIdentity(req, body = {}) {
+  const url = new URL(req.url);
   return {
-    clientId: body.clientId,
-    sessionId: body.sessionId,
+    clientId: body.clientId || url.searchParams.get('clientId'),
+    sessionId: body.sessionId || url.searchParams.get('sessionId'),
     ipKey: requestIpKey(req),
   };
 }
@@ -97,6 +98,7 @@ export async function handleChatRequest(req, options = {}) {
   const chatStore = options.chatStore || getChatStore();
   if (req.method === 'GET') {
     try {
+      await activeChatIdentity(req, {}, options, now);
       return jsonResponse(publicChatSnapshot(await readChatState(chatStore), now));
     } catch (error) {
       return chatRouteErrorResponse(error);

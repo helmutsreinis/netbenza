@@ -519,6 +519,53 @@ describe('frontend DOM updates', () => {
     assert.match(dom.window.document.getElementById('chat-messages')?.textContent || '', /hello chat/);
   });
 
+  it('polls chat with the active session identity in the query string', async () => {
+    const chatUrls = [];
+    const { context, dom } = loadFrontendHarness({
+      fetch: async (url) => {
+        if (String(url).startsWith('/api/chat?')) {
+          chatUrls.push(String(url));
+          return {
+            ok: true,
+            json: async () => ({
+              messages: [{
+                id: 'message-read',
+                clientId: 'client-chat-read',
+                handle: 'Chat Reader',
+                avatar: '/avatars/read.png',
+                text: 'read hello',
+                createdAt: 10,
+              }],
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    vm.runInContext(`
+      state.identity = {
+        clientId: 'client-chat-read',
+        sessionId: 'session-chat-read',
+        sessionStartedAt: 12345,
+        fingerprint: 'fingerprint-chat-read',
+        handle: 'Chat Reader',
+        avatar: '/avatars/read.png'
+      };
+    `, context);
+
+    await vm.runInContext('pollChat()', context);
+
+    assert.equal(chatUrls.length, 1);
+    const url = new URL(chatUrls[0], 'https://site.test');
+    assert.equal(url.pathname, '/api/chat');
+    assert.equal(url.searchParams.get('clientId'), 'client-chat-read');
+    assert.equal(url.searchParams.get('sessionId'), 'session-chat-read');
+    assert.equal(url.searchParams.has('handle'), false);
+    assert.equal(url.searchParams.has('avatar'), false);
+    assert.match(dom.window.document.getElementById('chat-messages')?.textContent || '', /read hello/);
+  });
+
   it('uses shuffled ids and the vote payload helper in both vote loops', async () => {
     const voteBodies = [];
     const { context, dom } = loadFrontendHarness({

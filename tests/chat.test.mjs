@@ -144,7 +144,17 @@ describe('Netlify chat route', () => {
   it('GET requires access and returns messages', async () => {
     const now = 1_500_000;
     const access = await accessContext({ now, ip: '198.51.100.50' });
+    const presenceStore = new MemoryPresenceStore();
     const chatStore = new MemoryPresenceStore();
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+      handle: 'Nina',
+      avatar: '/avatars/nina.png',
+    });
     await appendChatMessage(chatStore, {
       clientId: 'client-one',
       sessionId: 'session-one',
@@ -155,10 +165,11 @@ describe('Netlify chat route', () => {
 
     const denied = await chatHandler(new Request('https://site.test/api/chat'));
     const deniedBody = await denied.json();
-    const response = await handleChatRequest(new Request('https://site.test/api/chat', {
+    const response = await handleChatRequest(new Request('https://site.test/api/chat?clientId=client-one&sessionId=session-one', {
       headers: access.headers,
     }), {
       accessStore: access.store,
+      presenceStore,
       chatStore,
       nowFn: () => now + 1000,
     });
@@ -176,6 +187,53 @@ describe('Netlify chat route', () => {
       createdAt: now,
     }]);
     assert.equal(body.serverTime, now + 1000);
+  });
+
+  it('GET rejects stale sessions before returning messages', async () => {
+    let now = 1_700_000;
+    const access = await accessContext({ now, ip: '198.51.100.56' });
+    const presenceStore = new MemoryPresenceStore();
+    const chatStore = new MemoryPresenceStore();
+
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'old-session',
+      sessionStartedAt: now,
+      handle: 'Old tab',
+    });
+    now += 1;
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'new-session',
+      sessionStartedAt: now,
+      handle: 'New tab',
+    });
+    await appendChatMessage(chatStore, {
+      clientId: 'client-one',
+      sessionId: 'new-session',
+      ipKey: 'ip:198.51.100.56',
+      handle: 'New tab',
+      avatar: '/avatars/new.png',
+    }, 'hidden from stale tab', now, 'message-stale-get');
+
+    const response = await handleChatRequest(new Request('https://site.test/api/chat?clientId=client-one&sessionId=old-session', {
+      headers: access.headers,
+    }), {
+      accessStore: access.store,
+      presenceStore,
+      chatStore,
+      nowFn: () => now + 100,
+    });
+    const body = await response.json();
+
+    assert.equal(response.status, 409);
+    assert.equal(body.detail, 'client_replaced');
   });
 
   it('POST appends with active presence handle and avatar instead of spoofed body display fields', async () => {
@@ -363,24 +421,6 @@ describe('Netlify chat route', () => {
     const access = await accessContext({ now, ip: '198.51.100.54' });
     const presenceStore = new MemoryPresenceStore();
 
-    const missingResponse = await handleChatRequest(new Request('https://site.test/api/chat', {
-      headers: access.headers,
-    }), {
-      accessStore: access.store,
-      chatStore: new MemoryPresenceStore(),
-      nowFn: () => now,
-    });
-    const missingBody = await missingResponse.json();
-
-    const readFailureResponse = await handleChatRequest(new Request('https://site.test/api/chat', {
-      headers: access.headers,
-    }), {
-      accessStore: access.store,
-      chatStore: new FailingReadStore(),
-      nowFn: () => now,
-    });
-    const readFailureBody = await readFailureResponse.json();
-
     await activatePresence({
       store: presenceStore,
       headers: access.headers,
@@ -388,6 +428,27 @@ describe('Netlify chat route', () => {
       clientId: 'client-one',
       sessionId: 'session-one',
     });
+
+    const missingResponse = await handleChatRequest(new Request('https://site.test/api/chat?clientId=client-one&sessionId=session-one', {
+      headers: access.headers,
+    }), {
+      accessStore: access.store,
+      presenceStore,
+      chatStore: new MemoryPresenceStore(),
+      nowFn: () => now,
+    });
+    const missingBody = await missingResponse.json();
+
+    const readFailureResponse = await handleChatRequest(new Request('https://site.test/api/chat?clientId=client-one&sessionId=session-one', {
+      headers: access.headers,
+    }), {
+      accessStore: access.store,
+      presenceStore,
+      chatStore: new FailingReadStore(),
+      nowFn: () => now,
+    });
+    const readFailureBody = await readFailureResponse.json();
+
     const writeFailureResponse = await handleChatRequest(new Request('https://site.test/api/chat', {
       method: 'POST',
       headers: { ...access.headers, 'content-type': 'application/json' },
@@ -415,11 +476,21 @@ describe('Netlify chat route', () => {
   it('storage errors do not leak arbitrary IP-like exception messages', async () => {
     const now = 3_750_000;
     const access = await accessContext({ now, ip: '198.51.100.56' });
+    const presenceStore = new MemoryPresenceStore();
 
-    const response = await handleChatRequest(new Request('https://site.test/api/chat', {
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+    });
+
+    const response = await handleChatRequest(new Request('https://site.test/api/chat?clientId=client-one&sessionId=session-one', {
       headers: access.headers,
     }), {
       accessStore: access.store,
+      presenceStore,
       chatStore: new IpLeakReadStore(),
       nowFn: () => now,
     });

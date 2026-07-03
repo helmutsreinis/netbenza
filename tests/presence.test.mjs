@@ -303,6 +303,66 @@ describe('presence helpers', () => {
     assert.deepEqual(delayedJson.session, { active: false, reason: 'client_replaced' });
   });
 
+  it('keeps an existing session start time immutable on later heartbeats', async () => {
+    const store = new MemoryPresenceStore();
+    const ipHeaders = { 'x-real-ip': '203.0.113.221' };
+
+    await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'immutable-client',
+        sessionId: 'old-session',
+        sessionStartedAt: 1_000_000,
+        handle: 'Old tab',
+        avatar: '/avatars/old.png',
+        activity: 'online',
+      }),
+    }), store, () => 1_000_000);
+
+    await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'immutable-client',
+        sessionId: 'new-session',
+        sessionStartedAt: 1_000_500,
+        handle: 'New tab',
+        avatar: '/avatars/new.png',
+        activity: 'online',
+      }),
+    }), store, () => 1_000_500);
+
+    const staleResponse = await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'immutable-client',
+        sessionId: 'old-session',
+        sessionStartedAt: 1_001_000,
+        handle: 'Old tab',
+        avatar: '/avatars/old.png',
+        activity: 'online',
+      }),
+    }), store, () => 1_001_000);
+    const staleJson = await staleResponse.json();
+
+    const newResponse = await handlePresenceRequest(
+      new Request('https://site.test/api/presence?clientId=immutable-client&sessionId=new-session', {
+        headers: ipHeaders,
+      }),
+      store,
+      () => 1_001_100,
+    );
+    const newJson = await newResponse.json();
+    const oldRecord = await store.get(presenceKey('immutable-client', 'old-session'), { type: 'json' });
+
+    assert.deepEqual(staleJson.session, { active: false, reason: 'client_replaced' });
+    assert.deepEqual(staleJson.users.map((user) => user.handle), ['New tab']);
+    assert.equal(newJson.session.active, true);
+    assert.equal(oldRecord.sessionStartedAt, 1_000_000);
+  });
+
   it('clamps far-future sessionStartedAt values before they can poison high-watermarks', async () => {
     const store = new MemoryPresenceStore();
     const ipHeaders = { 'x-real-ip': '203.0.113.91' };

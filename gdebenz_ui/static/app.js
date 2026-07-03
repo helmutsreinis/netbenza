@@ -878,7 +878,12 @@ function renderVoteQueueItem(entry) {
 async function pollChat() {
   if (!canUseSessionActions()) return;
   try {
-    const data = await api('/api/chat');
+    const identity = ensurePresenceSession();
+    const params = new URLSearchParams({
+      clientId: identity.clientId,
+      sessionId: identity.sessionId,
+    });
+    const data = await api(`/api/chat?${params}`);
     renderChatMessages(data.messages || []);
   } catch (e) {
     if (isSessionReplacementError(e)) return;

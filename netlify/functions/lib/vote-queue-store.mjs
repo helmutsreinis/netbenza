@@ -5,10 +5,14 @@ import { getStore } from '@netlify/blobs';
 export const VOTE_INTERVAL_MS = 2000;
 export const PROCESSING_LEASE_MS = 30_000;
 
-const QUEUE_STATE_KEY = 'queue/state';
+const QUEUE_META_KEY = 'queue/meta';
+const QUEUE_ENTRY_PREFIX = 'queue/entries/';
+const LEGACY_QUEUE_STATE_KEY = 'queue/state';
+const LEGACY_MIGRATED_KEY = 'queue/legacy-migrated';
 const ACTIVE_STATES = new Set(['queued', 'processing']);
 const QUEUE_POLL_MS = 100;
 const DEFAULT_MAX_WAIT_MS = 60_000;
+let processingClaimCounter = 0;
 
 export function getVoteQueueStore() {
   return getStore({ name: 'gdebenz-vote-queue', consistency: 'strong' });
@@ -21,6 +25,10 @@ function defaultQueueState() {
     lastClientId: '',
     processingId: '',
   };
+}
+
+function queueEntryKey(entryId) {
+  return `${QUEUE_ENTRY_PREFIX}${clippedString(entryId, 120)}`;
 }
 
 function clone(value) {
@@ -70,9 +78,19 @@ function normalizeEntry(entry) {
     status: clippedString(entry.status, 40),
     queuedAt: normalizeTimestamp(entry.queuedAt),
     processingAt: normalizeTimestamp(entry.processingAt),
+    processingClaimedAt: normalizeTimestamp(entry.processingClaimedAt),
+    processingToken: clippedString(entry.processingToken, 120),
     processingLeaseUntil: normalizeTimestamp(entry.processingLeaseUntil),
     state,
     privateVote: clone(entry.privateVote || {}),
+  };
+}
+
+function normalizeMeta(state) {
+  return {
+    lastSubmissionAt: normalizeTimestamp(state?.lastSubmissionAt),
+    lastClientId: clippedString(state?.lastClientId, 120),
+    processingId: clippedString(state?.processingId, 120),
   };
 }
 
@@ -82,9 +100,7 @@ function normalizeState(state) {
     : [];
   return {
     entries,
-    lastSubmissionAt: normalizeTimestamp(state?.lastSubmissionAt),
-    lastClientId: clippedString(state?.lastClientId, 120),
-    processingId: clippedString(state?.processingId, 120),
+    ...normalizeMeta(state),
   };
 }
 
@@ -143,18 +159,108 @@ function cleanupStaleProcessing(state, now = Date.now()) {
   };
 }
 
-async function writeQueueState(store, state) {
-  const normalized = normalizeState(state);
-  await store.setJSON(QUEUE_STATE_KEY, normalized);
+async function readQueueMeta(store) {
+  return normalizeMeta(await store.get(QUEUE_META_KEY, { type: 'json' }));
+}
+
+async function readLegacyQueueState(store) {
+  const state = await store.get(LEGACY_QUEUE_STATE_KEY, { type: 'json' });
+  return state ? normalizeState(state) : null;
+}
+
+async function readLegacyMigrationMarker(store) {
+  return Boolean(await store.get(LEGACY_MIGRATED_KEY, { type: 'json' }));
+}
+
+async function readQueueEntries(store) {
+  const { blobs = [] } = await store.list({ prefix: QUEUE_ENTRY_PREFIX });
+  const entries = await Promise.all(blobs.map(async (blob) => (
+    normalizeEntry(await store.get(blob.key, { type: 'json' }))
+  )));
+  return entries.filter(Boolean);
+}
+
+async function writeQueueMeta(store, state) {
+  const normalized = normalizeMeta(state);
+  await store.setJSON(QUEUE_META_KEY, normalized);
   return normalized;
 }
 
-export async function readQueueState(store = getVoteQueueStore(), now = Date.now()) {
-  const state = await store.get(QUEUE_STATE_KEY, { type: 'json' });
-  if (!state) return defaultQueueState();
+async function writeQueueEntry(store, entry) {
+  const normalized = normalizeEntry(entry);
+  if (!normalized) throw queueError('queue_entry_invalid', 400);
+  await store.setJSON(queueEntryKey(normalized.id), normalized);
+  return normalized;
+}
+
+async function deleteQueueEntry(store, entryId) {
+  await store.delete(queueEntryKey(entryId));
+}
+
+async function deleteLegacyQueueState(store) {
+  await store.delete(LEGACY_QUEUE_STATE_KEY);
+}
+
+async function writeLegacyMigrationMarker(store, now) {
+  await store.setJSON(LEGACY_MIGRATED_KEY, {
+    migratedAt: normalizeTimestamp(now) || Date.now(),
+  });
+}
+
+function hasQueueStateData(state) {
   const normalized = normalizeState(state);
+  return Boolean(
+    normalized.entries.length
+    || normalized.lastSubmissionAt
+    || normalized.lastClientId
+    || normalized.processingId,
+  );
+}
+
+function mergeLegacyQueueState(legacyState, currentState) {
+  const legacy = normalizeState(legacyState);
+  const current = normalizeState(currentState);
+  const entries = new Map();
+  for (const entry of legacy.entries) entries.set(entry.id, entry);
+  for (const entry of current.entries) entries.set(entry.id, entry);
+  return normalizeState({
+    ...legacy,
+    entries: [...entries.values()],
+  });
+}
+
+export async function readQueueState(store = getVoteQueueStore(), now = Date.now()) {
+  const [meta, entries, legacyState, legacyMigrated] = await Promise.all([
+    readQueueMeta(store),
+    readQueueEntries(store),
+    readLegacyQueueState(store),
+    readLegacyMigrationMarker(store),
+  ]);
+  let normalized = normalizeState({ ...meta, entries });
+  const useLegacyState = !legacyMigrated && hasQueueStateData(legacyState);
+  if (useLegacyState) normalized = mergeLegacyQueueState(legacyState, normalized);
+
   const cleaned = cleanupStaleProcessing(normalized, now);
-  if (cleaned.changed) await writeQueueState(store, cleaned.state);
+  if (useLegacyState) {
+    const activeIds = new Set(cleaned.state.entries.map((entry) => entry.id));
+    await Promise.all([
+      ...cleaned.state.entries.map((entry) => writeQueueEntry(store, entry)),
+      ...normalized.entries
+        .filter((entry) => !activeIds.has(entry.id))
+        .map((entry) => deleteQueueEntry(store, entry.id)),
+    ]);
+    await writeQueueMeta(store, cleaned.state);
+    await writeLegacyMigrationMarker(store, now);
+    await deleteLegacyQueueState(store);
+  } else if (cleaned.changed) {
+    const activeIds = new Set(cleaned.state.entries.map((entry) => entry.id));
+    await Promise.all([
+      writeQueueMeta(store, cleaned.state),
+      ...normalized.entries
+        .filter((entry) => !activeIds.has(entry.id))
+        .map((entry) => deleteQueueEntry(store, entry.id)),
+    ]);
+  }
   return cleaned.state;
 }
 
@@ -205,9 +311,43 @@ export async function enqueueVoteEntry(store = getVoteQueueStore(), entry, now =
   const conflict = findActiveConflict(state.entries, normalizedEntry);
   if (conflict) throw queueError(conflict);
 
-  state.entries.push(normalizedEntry);
-  await writeQueueState(store, state);
+  await writeQueueEntry(store, normalizedEntry);
+  await reconcileActiveEntry(store, normalizedEntry, now);
   return normalizedEntry;
+}
+
+function entryOrder(left, right) {
+  const queuedAtCompare = Number(left.queuedAt || 0) - Number(right.queuedAt || 0);
+  if (queuedAtCompare) return queuedAtCompare;
+  return String(left.id || '').localeCompare(String(right.id || ''));
+}
+
+async function reconcileActiveEntry(store, entry, now) {
+  const state = await readQueueState(store, now);
+  const active = activeEntries(state.entries);
+  const sameClient = active
+    .filter((candidate) => candidate.clientId === entry.clientId)
+    .sort(entryOrder);
+  const sameIp = active
+    .filter((candidate) => candidate.ipKey === entry.ipKey)
+    .sort(entryOrder);
+
+  const clientWinner = sameClient[0];
+  if (clientWinner && clientWinner.id !== entry.id) {
+    await deleteQueueEntry(store, entry.id);
+    throw queueError('client_active');
+  }
+
+  const ipWinner = sameIp[0];
+  if (ipWinner && ipWinner.id !== entry.id) {
+    await deleteQueueEntry(store, entry.id);
+    throw queueError('ip_active');
+  }
+
+  const losers = [...sameClient, ...sameIp]
+    .filter((candidate) => candidate.id !== entry.id);
+  await Promise.all([...new Set(losers.map((candidate) => candidate.id))]
+    .map((entryId) => deleteQueueEntry(store, entryId)));
 }
 
 function compareQueuedEntries(left, right) {
@@ -237,6 +377,39 @@ export function selectNextVoteEntry(entries = [], lastClientId = '') {
   }
 
   return queued[0];
+}
+
+function processingClaimStamp() {
+  processingClaimCounter = (processingClaimCounter + 1) % 1000;
+  return (Date.now() * 1000) + processingClaimCounter;
+}
+
+function queuedEntry(entry) {
+  return {
+    ...entry,
+    state: 'queued',
+    processingAt: 0,
+    processingClaimedAt: 0,
+    processingToken: '',
+    processingLeaseUntil: 0,
+  };
+}
+
+function compareProcessingEntries(left, right) {
+  const claimCompare = Number(left.processingClaimedAt || 0) - Number(right.processingClaimedAt || 0);
+  if (claimCompare) return claimCompare;
+  const processingCompare = Number(left.processingAt || 0) - Number(right.processingAt || 0);
+  if (processingCompare) return processingCompare;
+  return String(left.id || '').localeCompare(String(right.id || ''));
+}
+
+function processingClaimHasTie(processingEntries, entry) {
+  if (!entry) return false;
+  const claim = normalizeTimestamp(entry?.processingClaimedAt);
+  return processingEntries.some((candidate) => (
+    candidate.id !== entry.id
+    && normalizeTimestamp(candidate.processingClaimedAt) === claim
+  ));
 }
 
 function fairQueuedEntries(entries = [], lastClientId = '') {
@@ -276,15 +449,53 @@ export async function markVoteEntryProcessing(
   const entry = state.entries.find((candidate) => candidate.id === entryId);
   if (!entry) return null;
   if (entry.state === 'processing') return entry;
+  if (state.entries.some((candidate) => candidate.state === 'processing')) return null;
+  if (millisecondsUntilVoteAllowed(state, now) > 0) return null;
   if (entry.state !== 'queued') return null;
+  if (selectNextVoteEntry(state.entries, state.lastClientId)?.id !== entry.id) return null;
 
   const processingAt = normalizeTimestamp(now) || Date.now();
   entry.state = 'processing';
   entry.processingAt = processingAt;
+  entry.processingClaimedAt = processingClaimStamp();
+  entry.processingToken = randomUUID();
   entry.processingLeaseUntil = processingAt + Math.max(1, Math.trunc(Number(leaseMs)) || PROCESSING_LEASE_MS);
   state.processingId = entry.id;
-  await writeQueueState(store, state);
-  return clone(entry);
+  await Promise.all([
+    writeQueueEntry(store, entry),
+    writeQueueMeta(store, state),
+  ]);
+
+  const validationState = await readQueueState(store, now);
+  const validationEntry = validationState.entries.find((candidate) => candidate.id === entry.id);
+  const processingEntries = validationState.entries
+    .filter((candidate) => candidate.state === 'processing')
+    .sort(compareProcessingEntries);
+  const processingOwner = processingEntries[0] || null;
+  const claimTied = processingClaimHasTie(processingEntries, validationEntry);
+  const ownsStoredClaim = validationEntry?.processingToken === entry.processingToken;
+  const intervalBlocked = millisecondsUntilVoteAllowed(validationState, now) > 0;
+
+  if (
+    !validationEntry
+    || validationEntry.state !== 'processing'
+    || !ownsStoredClaim
+    || processingOwner?.id !== entry.id
+    || claimTied
+    || intervalBlocked
+  ) {
+    if (validationEntry?.state === 'processing' && ownsStoredClaim) {
+      await writeQueueEntry(store, queuedEntry(validationEntry));
+    }
+    return null;
+  }
+
+  const staleProcessing = processingEntries.filter((candidate) => candidate.id !== entry.id);
+  await Promise.all([
+    ...staleProcessing.map((candidate) => writeQueueEntry(store, queuedEntry(candidate))),
+    writeQueueMeta(store, { ...validationState, processingId: entry.id }),
+  ]);
+  return clone(validationEntry);
 }
 
 export async function removeVoteEntry(store = getVoteQueueStore(), entryId, completion = {}, now = Date.now()) {
@@ -307,7 +518,10 @@ export async function removeVoteEntry(store = getVoteQueueStore(), entryId, comp
     }
   }
 
-  await writeQueueState(store, state);
+  await Promise.all([
+    deleteQueueEntry(store, entryId),
+    writeQueueMeta(store, state),
+  ]);
   return removed;
 }
 

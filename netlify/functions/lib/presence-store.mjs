@@ -478,9 +478,11 @@ async function applyPresencePost(store, identity, now) {
   const existing = await readStoreJson(store, key);
   const existingStartedAt = Math.trunc(Number(existing?.sessionStartedAt || 0)) || 0;
   const existingAcceptedAt = Math.trunc(Number(existing?.acceptedAt || 0)) || 0;
-  const keepEnded = Boolean(existing?.endedAt && existingStartedAt >= identity.sessionStartedAt);
+  const sessionStartedAt = existingStartedAt || identity.sessionStartedAt;
+  const keepEnded = Boolean(existing?.endedAt);
   const record = createPresenceRecord({
     ...identity,
+    sessionStartedAt,
     acceptedAt: existingAcceptedAt || now,
     endedAt: keepEnded ? existing.endedAt : 0,
   }, now);

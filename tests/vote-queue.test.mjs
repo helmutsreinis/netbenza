@@ -60,6 +60,61 @@ class FailingReadStore extends MemoryPresenceStore {
   }
 }
 
+class FailingDeleteStore extends MemoryPresenceStore {
+  async delete() {
+    throw new Error('blob_delete_failed');
+  }
+}
+
+class FailingMigrationEntryWriteStore extends MemoryPresenceStore {
+  async setJSON(key, value) {
+    if (String(key).startsWith('queue/entries/')) {
+      throw new Error('entry_write_failed');
+    }
+    return super.setJSON(key, value);
+  }
+}
+
+class BarrierEntryWriteStore extends MemoryPresenceStore {
+  constructor(expectedWrites = 2) {
+    super();
+    this.expectedWrites = expectedWrites;
+    this.waiting = [];
+  }
+
+  async setJSON(key, value) {
+    if (String(key).startsWith('queue/entries/')) {
+      await new Promise((resolve) => {
+        this.waiting.push(resolve);
+        if (this.waiting.length >= this.expectedWrites) {
+          this.waiting.splice(0).forEach((release) => release());
+        }
+      });
+    }
+    return super.setJSON(key, value);
+  }
+}
+
+class BarrierProcessingWriteStore extends MemoryPresenceStore {
+  constructor(expectedWrites = 2) {
+    super();
+    this.expectedWrites = expectedWrites;
+    this.waiting = [];
+  }
+
+  async setJSON(key, value) {
+    if (String(key).startsWith('queue/entries/') && value?.state === 'processing') {
+      await new Promise((resolve) => {
+        this.waiting.push(resolve);
+        if (this.waiting.length >= this.expectedWrites) {
+          this.waiting.splice(0).forEach((release) => release());
+        }
+      });
+    }
+    return super.setJSON(key, value);
+  }
+}
+
 describe('vote queue store', () => {
   it('exposes only public queue fields', () => {
     const entry = createVoteQueueEntry({
@@ -116,6 +171,82 @@ describe('vote queue store', () => {
     await assert.rejects(() => readQueueState(new FailingReadStore(), 1000), /blob_read_failed/);
   });
 
+  it('migrates legacy single-blob queue state into per-entry storage', async () => {
+    const store = new MemoryPresenceStore();
+    const entry = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now: 10_000,
+      id: 'legacy-entry',
+    });
+
+    await store.setJSON('queue/state', {
+      entries: [entry],
+      lastSubmissionAt: 9_000,
+      lastClientId: 'bob',
+      processingId: '',
+    });
+
+    const state = await readQueueState(store, 10_500);
+    const migratedEntry = await store.get('queue/entries/legacy-entry', { type: 'json' });
+    const migratedMeta = await store.get('queue/meta', { type: 'json' });
+
+    assert.deepEqual(state.entries.map((candidate) => candidate.id), ['legacy-entry']);
+    assert.equal(state.lastSubmissionAt, 9_000);
+    assert.equal(state.lastClientId, 'bob');
+    assert.equal(migratedEntry.id, 'legacy-entry');
+    assert.equal(migratedMeta.lastSubmissionAt, 9_000);
+    assert.equal(migratedMeta.lastClientId, 'bob');
+  });
+
+  it('does not resurrect migrated legacy entries after removal', async () => {
+    const store = new MemoryPresenceStore();
+    const entry = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now: 10_000,
+      id: 'legacy-remove',
+    });
+
+    await store.setJSON('queue/state', {
+      entries: [entry],
+      lastSubmissionAt: 0,
+      lastClientId: '',
+      processingId: '',
+    });
+
+    await readQueueState(store, 10_500);
+    await removeVoteEntry(store, 'legacy-remove', {}, 10_600);
+    const state = await readQueueState(store, 10_700);
+
+    assert.deepEqual(state.entries, []);
+    assert.equal(await store.get('queue/state', { type: 'json' }), null);
+  });
+
+  it('keeps legacy queue state when migration entry writes fail', async () => {
+    const store = new FailingMigrationEntryWriteStore();
+    const entry = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now: 10_000,
+      id: 'legacy-write-failure',
+    });
+
+    await store.setJSON('queue/state', {
+      entries: [entry],
+      lastSubmissionAt: 0,
+      lastClientId: '',
+      processingId: '',
+    });
+
+    await assert.rejects(() => readQueueState(store, 10_500), /entry_write_failed/);
+
+    const legacyState = await store.get('queue/state', { type: 'json' });
+    assert.deepEqual(legacyState.entries.map((candidate) => candidate.id), ['legacy-write-failure']);
+    assert.equal(await store.get('queue/meta', { type: 'json' }), null);
+    assert.equal(await store.get('queue/legacy-migrated', { type: 'json' }), null);
+  });
+
   it('allows one active queued or processing vote per clientId and per ipKey', async () => {
     const store = new MemoryPresenceStore();
     const now = Date.now();
@@ -145,6 +276,58 @@ describe('vote queue store', () => {
     await markVoteEntryProcessing(store, first.id, now + 3);
     await assert.rejects(() => enqueueVoteEntry(store, secondSameClient), /client_active/);
     await assert.rejects(() => enqueueVoteEntry(store, thirdSameIp), /ip_active/);
+  });
+
+  it('keeps concurrent enqueues from different users instead of losing one write', async () => {
+    const store = new BarrierEntryWriteStore(2);
+    const aliceEntry = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now: 1_000,
+      id: 'concurrent-alice',
+    });
+    const bobEntry = createVoteQueueEntry({
+      identity: bob,
+      vote: vote({ osmId: '201', status: 'no' }),
+      now: 1_001,
+      id: 'concurrent-bob',
+    });
+
+    await Promise.all([
+      enqueueVoteEntry(store, aliceEntry, 1_000),
+      enqueueVoteEntry(store, bobEntry, 1_001),
+    ]);
+
+    const state = await readQueueState(store, 1_002);
+    assert.deepEqual(
+      state.entries.map((entry) => entry.id).sort(),
+      ['concurrent-alice', 'concurrent-bob'],
+    );
+  });
+
+  it('allows only one concurrent processing claim for the same queued entry', async () => {
+    const store = new BarrierProcessingWriteStore(2);
+    const entry = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now: 1_000,
+      id: 'claim-alice',
+    });
+
+    await enqueueVoteEntry(store, entry, 1_000);
+    const results = await Promise.all([
+      markVoteEntryProcessing(store, entry.id, 2_000),
+      markVoteEntryProcessing(store, entry.id, 2_000),
+    ]);
+
+    const winners = results.filter(Boolean);
+    const state = await readQueueState(store, 2_000);
+    const processingEntries = state.entries.filter((candidate) => candidate.state === 'processing');
+
+    assert.equal(winners.length, 1);
+    assert.equal(processingEntries.length, 1);
+    assert.equal(processingEntries[0].id, 'claim-alice');
+    assert.equal(state.processingId, 'claim-alice');
   });
 
   it('rotates selection across clientIds after the last submitted client', () => {
@@ -200,6 +383,24 @@ describe('vote queue store', () => {
     assert.equal(state.processingId, '');
     assert.equal(state.lastSubmissionAt, now + 3000);
     assert.equal(state.lastClientId, 'alice');
+  });
+
+  it('propagates delete failures when completing entries', async () => {
+    const store = new FailingDeleteStore();
+    const now = Date.now();
+    const entry = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now,
+      id: 'delete-failure',
+    });
+
+    await enqueueVoteEntry(store, entry);
+    await markVoteEntryProcessing(store, entry.id, now + 100);
+    await assert.rejects(() => removeVoteEntry(store, entry.id, {
+      lastSubmissionAt: now + 3000,
+      lastClientId: 'alice',
+    }), /blob_delete_failed/);
   });
 
   it('runner enqueues and submits only the caller vote selected by fair order', async () => {
