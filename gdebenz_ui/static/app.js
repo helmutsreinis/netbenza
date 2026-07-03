@@ -630,14 +630,15 @@ function deselectAllPage() {
 
 function updateSelectedCount() {
   $('#stats-selected').textContent = `Selected: ${state.allSelected.size} (total across all pages)`;
-  $('#vote-count').textContent = state.allSelected.size;
+  const voteCount = $('#vote-count');
+  if (voteCount) voteCount.textContent = state.allSelected.size;
 }
 function updateVoteBtn() {
   const btn = $('#vote-btn');
   btn.disabled = !$('#vote-status').value || state.totalFiltered === 0;
-  btn.textContent = state.totalFiltered
-    ? `🗳 Vote ALL (${state.totalFiltered} filtered)`
-    : '🗳 Vote ALL';
+  btn.innerHTML = state.totalFiltered
+    ? `🗳 Vote ALL (<span id="vote-count">${state.allSelected.size}</span> / ${state.totalFiltered} filtered)`
+    : `🗳 Vote ALL (<span id="vote-count">${state.allSelected.size}</span>)`;
 }
 
 // ── Voting (ALL filtered stations across all pages) ──
@@ -664,14 +665,14 @@ async function doVote() {
   } catch (e) {
     toast('Failed to fetch station IDs: ' + e.message);
     btn.disabled = false;
-    btn.textContent = `🗳 Vote ALL (${state.totalFiltered})`;
+    updateVoteBtn();
     return;
   }
 
   if (!ids.length) {
     toast('No stations to vote on');
     btn.disabled = false;
-    btn.textContent = `🗳 Vote ALL`;
+    updateVoteBtn();
     return;
   }
 
@@ -748,7 +749,6 @@ async function doVote() {
   progPct.textContent = '100%';
   progBadge.textContent = 'COMPLETE';
   progCur.textContent = '';
-  btn.textContent = `🗳 Vote ALL (${state.totalFiltered})`;
   btn.disabled = false;
   $('#vote-status').value = '';
   updateVoteBtn();
