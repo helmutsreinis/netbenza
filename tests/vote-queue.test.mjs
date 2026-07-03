@@ -187,6 +187,12 @@ describe('vote queue store', () => {
   it('runner enqueues and submits only the caller vote selected by fair order', async () => {
     const store = new MemoryPresenceStore();
     let now = 10_000;
+    const priorBob = createVoteQueueEntry({
+      identity: bob,
+      vote: vote({ osmId: '200', status: 'queue' }),
+      now: now - 4_000,
+      id: 'prior-bob',
+    });
     const bobEntry = createVoteQueueEntry({
       identity: bob,
       vote: vote({ osmId: '201', status: 'no', text: 'bob private' }),
@@ -195,8 +201,13 @@ describe('vote queue store', () => {
     });
     const submitted = [];
 
+    await enqueueVoteEntry(store, priorBob, now - 4_000);
+    await markVoteEntryProcessing(store, priorBob.id, now - 4_000);
+    await removeVoteEntry(store, priorBob.id, {
+      lastSubmissionAt: now - VOTE_INTERVAL_MS,
+      lastClientId: 'bob',
+    }, now - VOTE_INTERVAL_MS);
     await enqueueVoteEntry(store, bobEntry);
-    await removeVoteEntry(store, 'missing-entry', { lastClientId: 'bob' });
 
     const result = await runQueuedVote({
       queueStore: store,
@@ -291,6 +302,12 @@ describe('vote queue store', () => {
   it('runner removes its queued entry when waiting times out before submission', async () => {
     const store = new MemoryPresenceStore();
     let now = 40_000;
+    const priorAlice = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '100', status: 'queue' }),
+      now: now - 4_000,
+      id: 'prior-alice',
+    });
     const bobEntry = createVoteQueueEntry({
       identity: bob,
       vote: vote({ osmId: '201', status: 'no' }),
@@ -298,8 +315,13 @@ describe('vote queue store', () => {
       id: 'bob-blocks-alice',
     });
 
+    await enqueueVoteEntry(store, priorAlice, now - 4_000);
+    await markVoteEntryProcessing(store, priorAlice.id, now - 4_000);
+    await removeVoteEntry(store, priorAlice.id, {
+      lastSubmissionAt: now - VOTE_INTERVAL_MS,
+      lastClientId: 'alice',
+    }, now - VOTE_INTERVAL_MS);
     await enqueueVoteEntry(store, bobEntry);
-    await removeVoteEntry(store, 'missing-entry', { lastClientId: 'alice' });
 
     await assert.rejects(() => runQueuedVote({
       queueStore: store,
@@ -384,9 +406,54 @@ describe('vote queue store', () => {
 
     assert.deepEqual(snapshot.entries.map((entry) => [entry.position, entry.id]), [
       [1, 'bob-next'],
-      [2, 'cara-after'],
-      [3, 'alice-first'],
+      [2, 'alice-first'],
+      [3, 'cara-after'],
     ]);
+  });
+
+  it('interleaves public positions by repeated fair selection', () => {
+    const entries = [
+      createVoteQueueEntry({
+        identity: alice,
+        vote: vote({ osmId: '101' }),
+        now: 100,
+        id: 'a1',
+      }),
+      createVoteQueueEntry({
+        identity: bob,
+        vote: vote({ osmId: '201', status: 'no' }),
+        now: 110,
+        id: 'b1',
+      }),
+      createVoteQueueEntry({
+        identity: alice,
+        vote: vote({ osmId: '102', status: 'queue' }),
+        now: 120,
+        id: 'a2',
+      }),
+      createVoteQueueEntry({
+        identity: bob,
+        vote: vote({ osmId: '202', status: 'yes' }),
+        now: 130,
+        id: 'b2',
+      }),
+      createVoteQueueEntry({
+        identity: cara,
+        vote: vote({ osmId: '301', status: 'queue' }),
+        now: 140,
+        id: 'c1',
+      }),
+    ];
+
+    const snapshot = publicQueueSnapshot({
+      entries,
+      lastSubmissionAt: 0,
+      lastClientId: 'alice',
+      processingId: '',
+    }, 200);
+
+    assert.deepEqual(snapshot.entries.map((entry) => entry.id), ['b1', 'c1', 'a1', 'b2', 'a2']);
+    assert.deepEqual(snapshot.entries.map((entry) => entry.position), [1, 2, 3, 4, 5]);
   });
 
   it('exposes processing item separately without private fields', () => {
@@ -438,5 +505,45 @@ describe('vote queue store', () => {
     assert.equal(serialized.includes('processing secret'), false);
     assert.equal(serialized.includes('queued secret'), false);
     assert.equal(serialized.includes('private-fingerprint'), false);
+  });
+
+  it('ignores stale completion after lease reclamation when a newer submission exists', async () => {
+    const store = new MemoryPresenceStore();
+    const processingAt = 70_000;
+    const staleNow = processingAt + PROCESSING_LEASE_MS + 1;
+    const newerSubmissionAt = staleNow + 5_000;
+    const staleEntry = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now: processingAt,
+      id: 'late-stale-processing',
+    });
+    const newerEntry = createVoteQueueEntry({
+      identity: bob,
+      vote: vote({ osmId: '201', status: 'no' }),
+      now: newerSubmissionAt,
+      id: 'newer-submission',
+    });
+
+    await enqueueVoteEntry(store, staleEntry, processingAt);
+    await markVoteEntryProcessing(store, staleEntry.id, processingAt);
+    await readQueueState(store, staleNow);
+
+    await enqueueVoteEntry(store, newerEntry, newerSubmissionAt);
+    await markVoteEntryProcessing(store, newerEntry.id, newerSubmissionAt);
+    await removeVoteEntry(store, newerEntry.id, {
+      lastSubmissionAt: newerSubmissionAt,
+      lastClientId: 'bob',
+    }, newerSubmissionAt);
+
+    await removeVoteEntry(store, staleEntry.id, {
+      lastSubmissionAt: processingAt,
+      lastClientId: 'alice',
+    }, processingAt);
+
+    const state = await readQueueState(store, newerSubmissionAt);
+    assert.equal(state.lastSubmissionAt, newerSubmissionAt);
+    assert.equal(state.lastClientId, 'bob');
+    assert.deepEqual(state.entries, []);
   });
 });

@@ -243,22 +243,19 @@ function fairQueuedEntries(entries = [], lastClientId = '') {
   const queued = entries
     .filter((entry) => entry?.state === 'queued')
     .sort(compareQueuedEntries);
-  if (!queued.length) return [];
+  const ordered = [];
+  let virtualLastClientId = lastClientId;
 
-  const clientOrder = [];
-  for (const entry of queued) {
-    if (!clientOrder.includes(entry.clientId)) clientOrder.push(entry.clientId);
+  while (queued.length) {
+    const next = selectNextVoteEntry(queued, virtualLastClientId);
+    if (!next) break;
+    ordered.push(next);
+    virtualLastClientId = next.clientId;
+    const selectedIndex = queued.findIndex((entry) => entry.id === next.id);
+    queued.splice(selectedIndex >= 0 ? selectedIndex : 0, 1);
   }
 
-  const startIndex = lastClientId && clientOrder.includes(lastClientId)
-    ? (clientOrder.indexOf(lastClientId) + 1) % clientOrder.length
-    : 0;
-  const rotatedClients = [
-    ...clientOrder.slice(startIndex),
-    ...clientOrder.slice(0, startIndex),
-  ];
-
-  return rotatedClients.flatMap((clientId) => queued.filter((entry) => entry.clientId === clientId));
+  return ordered;
 }
 
 export function millisecondsUntilVoteAllowed(state = {}, now = Date.now()) {
@@ -296,11 +293,18 @@ export async function removeVoteEntry(store = getVoteQueueStore(), entryId, comp
   state.entries = state.entries.filter((entry) => entry.id !== entryId);
 
   if (state.processingId === entryId) state.processingId = '';
-  if (Object.hasOwn(completion, 'lastSubmissionAt')) {
-    state.lastSubmissionAt = normalizeTimestamp(completion.lastSubmissionAt);
-  }
-  if (Object.hasOwn(completion, 'lastClientId')) {
-    state.lastClientId = clippedString(completion.lastClientId, 120);
+  if (removed) {
+    if (Object.hasOwn(completion, 'lastSubmissionAt')) {
+      const completedAt = normalizeTimestamp(completion.lastSubmissionAt);
+      if (completedAt >= state.lastSubmissionAt) {
+        state.lastSubmissionAt = completedAt;
+        if (Object.hasOwn(completion, 'lastClientId')) {
+          state.lastClientId = clippedString(completion.lastClientId, 120);
+        }
+      }
+    } else if (Object.hasOwn(completion, 'lastClientId')) {
+      state.lastClientId = clippedString(completion.lastClientId, 120);
+    }
   }
 
   await writeQueueState(store, state);
