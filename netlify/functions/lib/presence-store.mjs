@@ -2,7 +2,6 @@ import { getStore } from '@netlify/blobs';
 import { requestIpKey } from './request-context.mjs';
 
 export const ACTIVE_WINDOW_MS = 25_000;
-export const SESSION_STARTED_AT_FUTURE_TOLERANCE_MS = 120_000;
 
 const ALLOWED_ACTIVITIES = new Set([
   'online',
@@ -39,9 +38,8 @@ export function normalizeSessionStartedAt(value, now = Date.now()) {
   if (!Number.isFinite(normalized) || normalized <= 0) {
     throw new Error('sessionStartedAt is required');
   }
-  if (normalized > now + SESSION_STARTED_AT_FUTURE_TOLERANCE_MS) {
-    throw new Error('sessionStartedAt is too far in the future');
-  }
+  const serverNow = Math.trunc(Number(now));
+  if (Number.isFinite(serverNow) && serverNow > 0 && normalized > serverNow) return serverNow;
   return normalized;
 }
 

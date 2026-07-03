@@ -303,7 +303,7 @@ describe('presence helpers', () => {
     assert.deepEqual(delayedJson.session, { active: false, reason: 'client_replaced' });
   });
 
-  it('rejects far-future sessionStartedAt values before they can poison high-watermarks', async () => {
+  it('clamps far-future sessionStartedAt values before they can poison high-watermarks', async () => {
     const store = new MemoryPresenceStore();
     const ipHeaders = { 'x-real-ip': '203.0.113.91' };
     const now = 50_000;
@@ -321,9 +321,12 @@ describe('presence helpers', () => {
       }),
     }), store, () => now);
     const futureJson = await futureResponse.json();
+    const futureRecord = await store.get(presenceKey('future-client', 'future-session'), { type: 'json' });
 
-    assert.equal(futureResponse.status, 400);
-    assert.match(futureJson.detail, /sessionStartedAt/);
+    assert.equal(futureResponse.status, 200);
+    assert.deepEqual(futureJson.users.map((user) => user.handle), ['Future tab']);
+    assert.equal(futureRecord.sessionStartedAt, now);
+    assert.equal(futureRecord.acceptedAt, now);
 
     const normalResponse = await handlePresenceRequest(new Request('https://site.test/api/presence', {
       method: 'POST',
@@ -341,7 +344,49 @@ describe('presence helpers', () => {
 
     assert.equal(normalResponse.status, 200);
     assert.deepEqual(normalJson.users.map((user) => user.handle), ['Normal tab']);
-    assert.equal(await store.get(presenceKey('future-client', 'future-session'), { type: 'json' }), null);
+    assert.deepEqual(normalJson.session, { active: true });
+  });
+
+  it('clamps near-future same-client sessions so they cannot block normal sessions after expiry', async () => {
+    const store = new MemoryPresenceStore();
+    const ipHeaders = { 'x-real-ip': '203.0.113.94' };
+    const now = 52_000;
+
+    await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'near-future-client',
+        sessionId: 'near-future-session',
+        sessionStartedAt: now + 60_000,
+        handle: 'Near future tab',
+        avatar: '/avatars/future.png',
+        activity: 'online',
+      }),
+    }), store, () => now);
+    const futureRecord = await store.get(presenceKey('near-future-client', 'near-future-session'), { type: 'json' });
+
+    const later = now + ACTIVE_WINDOW_MS + 1;
+    const normalResponse = await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'near-future-client',
+        sessionId: 'normal-after-near-future',
+        sessionStartedAt: later,
+        handle: 'Normal after near future',
+        avatar: '/avatars/normal.png',
+        activity: 'searching',
+      }),
+    }), store, () => later);
+    const normalJson = await normalResponse.json();
+    const clientState = await store.get('clients/near-future-client', { type: 'json' });
+
+    assert.equal(futureRecord.sessionStartedAt, now);
+    assert.equal(normalResponse.status, 200);
+    assert.deepEqual(normalJson.users.map((user) => user.handle), ['Normal after near future']);
+    assert.deepEqual(normalJson.session, { active: true });
+    assert.equal(clientState.latestStartedAt, later);
   });
 
   it('ignores previously stored far-future high-watermarks when accepting a normal session', async () => {
@@ -619,7 +664,7 @@ describe('presence helpers', () => {
     assert.deepEqual(staleJson.session, { active: false, reason: 'ip_replaced' });
   });
 
-  it('rejects a far-future same-IP profile before it can replace the active profile', async () => {
+  it('clamps future-ish same-IP profile times so later normal profiles can replace them', async () => {
     const store = new MemoryPresenceStore();
     const ipHeaders = { 'x-forwarded-for': '198.51.100.102' };
     const now = 80_000;
@@ -637,29 +682,49 @@ describe('presence helpers', () => {
       }),
     }), store, () => now);
 
+    const futureReceipt = now + 1000;
     const futureResponse = await handlePresenceRequest(new Request('https://site.test/api/presence', {
       method: 'POST',
       headers: ipHeaders,
       body: JSON.stringify({
         clientId: 'same-ip-future',
         sessionId: 'future-session',
-        sessionStartedAt: now + 10 * 60_000,
+        sessionStartedAt: now + 60_000,
         handle: 'Future IP',
         avatar: '/avatars/future-ip.png',
         activity: 'online',
       }),
-    }), store, () => now + 1000);
+    }), store, () => futureReceipt);
     const futureJson = await futureResponse.json();
-    const snapshot = await presenceSnapshot(store, now + 1000, {
+    const futureRecord = await store.get(presenceKey('same-ip-future', 'future-session'), { type: 'json' });
+    const snapshot = await presenceSnapshot(store, futureReceipt, {
       clientId: 'same-ip-future',
       sessionId: 'future-session',
       ipKey: 'ip:198.51.100.102',
     });
 
-    assert.equal(futureResponse.status, 400);
-    assert.match(futureJson.detail, /sessionStartedAt/);
-    assert.deepEqual(snapshot.users.map((user) => user.clientId), ['same-ip-current']);
-    assert.equal(await store.get(presenceKey('same-ip-future', 'future-session'), { type: 'json' }), null);
+    const later = futureReceipt + ACTIVE_WINDOW_MS + 1;
+    const normalResponse = await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'same-ip-normal',
+        sessionId: 'normal-session',
+        sessionStartedAt: later,
+        handle: 'Normal IP',
+        avatar: '/avatars/normal-ip.png',
+        activity: 'online',
+      }),
+    }), store, () => later);
+    const normalJson = await normalResponse.json();
+
+    assert.equal(futureResponse.status, 200);
+    assert.deepEqual(futureJson.users.map((user) => user.clientId), ['same-ip-future']);
+    assert.equal(futureRecord.sessionStartedAt, futureReceipt);
+    assert.deepEqual(snapshot.users.map((user) => user.clientId), ['same-ip-future']);
+    assert.equal(normalResponse.status, 200);
+    assert.deepEqual(normalJson.users.map((user) => user.clientId), ['same-ip-normal']);
+    assert.deepEqual(normalJson.session, { active: true });
   });
 
   it('does not remove an active record when DELETE omits sessionId', async () => {
