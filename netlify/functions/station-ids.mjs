@@ -4,24 +4,24 @@ import {
   queryOptions,
 } from './lib/gdebenz-client.mjs';
 import { allBenzinStationIds, isBenzinUnavailableError } from './lib/benzin-client.mjs';
-import { assertRequestAccess, getAccessGateStore } from './lib/access-gate-store.mjs';
+import { assertRequestAccess } from './lib/access-gate-store.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed } from './lib/http.mjs';
 
-export default async function handler(req, accessStore = getAccessGateStore()) {
+export async function handleStationIdsRequest(req, options = {}) {
   if (req.method !== 'GET') return methodNotAllowed(['GET']);
   try {
-    await assertRequestAccess(req, accessStore);
+    await assertRequestAccess(req, { accessStore: options.accessStore, now: options.now });
   } catch (error) {
     return errorResponse(error.status || 401, error.code || error.message || 'access_denied');
   }
   const url = new URL(req.url);
-  const options = queryOptions(url.searchParams);
+  const query = queryOptions(url.searchParams);
 
   try {
     return jsonResponse(
-      options.source === 'benzin'
-        ? await allBenzinStationIds(options)
-        : await allStationIds(options),
+      query.source === 'benzin'
+        ? await allBenzinStationIds(query)
+        : await allStationIds(query),
     );
   } catch (error) {
     return errorResponse(
@@ -29,6 +29,10 @@ export default async function handler(req, accessStore = getAccessGateStore()) {
       error.message || 'Station lookup failed',
     );
   }
+}
+
+export default async function handler(req) {
+  return handleStationIdsRequest(req);
 }
 
 export const config = { path: '/api/stations/ids' };

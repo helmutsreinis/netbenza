@@ -7,6 +7,7 @@ import {
   ACCESS_TOKEN_TTL_MS,
   MemoryAccessGateStore,
   assertAccessToken,
+  assertRequestAccess,
   createAccessChallenge,
   issueAccessToken,
   publicChallenge,
@@ -158,6 +159,13 @@ describe('access gate', () => {
         now: now + ACCESS_CHALLENGE_TTL_MS + 1,
       }),
       { status: 401, code: 'access_challenge_expired' },
+    );
+  });
+
+  it('rejects missing request tokens before opening the default blob store', async () => {
+    await assert.rejects(
+      assertRequestAccess(new Request('https://site.test/api/config')),
+      { status: 401, code: 'access_token_missing' },
     );
   });
 

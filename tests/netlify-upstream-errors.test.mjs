@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import stationsHandler from '../netlify/functions/stations.mjs';
+import { handleStationsRequest } from '../netlify/functions/stations.mjs';
 import {
   MemoryAccessGateStore,
   createAccessChallenge,
@@ -41,10 +41,10 @@ describe('Netlify upstream error responses', () => {
     };
 
     try {
-      const response = await stationsHandler(new Request(
+      const response = await handleStationsRequest(new Request(
         'http://localhost/api/stations?lat=55.7520&lon=37.6178&radius=20',
         { method: 'GET', headers: access.headers },
-      ), access.store);
+      ), { accessStore: access.store });
       const body = await response.json();
 
       assert.equal(response.status, 502);

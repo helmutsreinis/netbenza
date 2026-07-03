@@ -187,14 +187,20 @@ export async function assertAccessToken(store, options = {}) {
   return token;
 }
 
-export async function assertRequestAccess(req, store = getAccessGateStore(), now = Date.now()) {
+export async function assertRequestAccess(req, options = {}) {
   const url = new URL(req.url);
   const accessToken = req.headers.get('x-access-token') || url.searchParams.get('accessToken');
   const accessSessionId = req.headers.get('x-access-session') || url.searchParams.get('accessSessionId');
-  return assertAccessToken(store, {
+  const now = options.now ?? options.nowFn?.() ?? Date.now();
+  const tokenOptions = {
     accessToken,
     accessSessionId,
     ipKey: requestIpKey(req),
     now,
+  };
+  if (!accessToken || !accessSessionId) return assertAccessToken(null, tokenOptions);
+  const store = options.accessStore || options.store || getAccessGateStore();
+  return assertAccessToken(store, {
+    ...tokenOptions,
   });
 }

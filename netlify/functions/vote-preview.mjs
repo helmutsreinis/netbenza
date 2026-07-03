@@ -3,28 +3,32 @@ import {
   queryOptions,
   votePreview,
 } from './lib/gdebenz-client.mjs';
-import { assertRequestAccess, getAccessGateStore } from './lib/access-gate-store.mjs';
+import { assertRequestAccess } from './lib/access-gate-store.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed } from './lib/http.mjs';
 
-export default async function handler(req, accessStore = getAccessGateStore()) {
+export async function handleVotePreviewRequest(req, options = {}) {
   if (req.method !== 'POST') return methodNotAllowed(['POST']);
   try {
-    await assertRequestAccess(req, accessStore);
+    await assertRequestAccess(req, { accessStore: options.accessStore, now: options.now });
   } catch (error) {
     return errorResponse(error.status || 401, error.code || error.message || 'access_denied');
   }
   const url = new URL(req.url);
-  const options = queryOptions(url.searchParams);
-  if (!url.searchParams.has('limit')) options.limit = 200;
+  const query = queryOptions(url.searchParams);
+  if (!url.searchParams.has('limit')) query.limit = 200;
 
   try {
-    return jsonResponse(await votePreview(options));
+    return jsonResponse(await votePreview(query));
   } catch (error) {
     return errorResponse(
       isGdeBenzUnavailableError(error) ? 502 : 400,
       error.message || 'Vote preview failed',
     );
   }
+}
+
+export default async function handler(req) {
+  return handleVotePreviewRequest(req);
 }
 
 export const config = { path: '/api/vote/preview' };
