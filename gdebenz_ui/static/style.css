@@ -4,9 +4,9 @@
 
 :root {
   --bg: #0b0f16;
-  --bg-card: #111827;
-  --bg-input: #1a1f2e;
-  --border: #1e293b;
+  --bg-card: rgba(17, 24, 39, .9);
+  --bg-input: rgba(26, 31, 46, .9);
+  --border: rgba(75, 93, 121, .45);
   --text: #e2e8f0;
   --text-dim: #94a3b8;
   --text-muted: #64748b;
@@ -25,7 +25,10 @@
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-  background: var(--bg);
+  background:
+    linear-gradient(rgba(7, 11, 18, .76), rgba(7, 11, 18, .88)),
+    url('/static/background/5U4X2T2RMFIVVMURCXPHMYEMTQ.png') center / cover fixed no-repeat,
+    var(--bg);
   color: var(--text);
   line-height: 1.5;
   min-height: 100vh;
