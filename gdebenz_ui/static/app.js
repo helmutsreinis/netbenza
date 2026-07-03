@@ -11,7 +11,7 @@ const PRESENCE_POLL_MS = 4000;
 const PRESENCE_PUSH_MIN_MS = 1500;
 const ACTIVITY_IDLE_MS = 15000;
 const POTEMKIN_STANDBY_MESSAGE = 'Live station data is unavailable for a moment. Try again shortly.';
-const RESULT_MAP_PIN_COLOR = '#FF4D5A';
+const RESULT_MAP_PIN_COLOR = '#7F1D1D';
 const POTEMKIN_VIDEO_FILES = [
   '17798970387630865084.mp4',
   '7OZ3wCRuoxyton22.mp4',
@@ -812,8 +812,8 @@ function renderResultsMap(stations) {
       icon: window.L.divIcon({
         className: '',
         html: `<span class="result-map-marker" style="background:${RESULT_MAP_PIN_COLOR}"></span>`,
-        iconSize: [18, 18],
-        iconAnchor: [9, 9],
+        iconSize: [24, 24],
+        iconAnchor: [12, 12],
       }),
       title: station.name || station.brand || 'Gas Station',
     }).addTo(map);

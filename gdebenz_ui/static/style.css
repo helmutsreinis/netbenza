@@ -412,11 +412,14 @@ main {
   font-size: 12px;
 }
 .result-map-marker {
-  width: 18px !important;
-  height: 18px !important;
-  border: 2px solid #fff;
+  display: block;
+  width: 24px !important;
+  height: 24px !important;
+  border: 3px solid #fff;
   border-radius: 50%;
-  box-shadow: 0 2px 12px rgba(0, 0, 0, .38);
+  box-shadow:
+    0 0 0 2px rgba(127, 29, 29, .4),
+    0 3px 14px rgba(0, 0, 0, .52);
 }
 .result-map-popup {
   min-width: 170px;

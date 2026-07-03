@@ -228,7 +228,7 @@ describe('frontend DOM updates', () => {
     `, context);
 
     assert.equal(markerIcons.length, 1);
-    assert.match(markerIcons[0].html, /background:#FF4D5A/);
+    assert.match(markerIcons[0].html, /background:#7F1D1D/);
   });
 
   it('keeps ordinary search errors in the compact warning state', () => {

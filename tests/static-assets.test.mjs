@@ -32,4 +32,12 @@ describe('static assets', () => {
     assert.match(css, /main\s*\{[^}]*max-width:\s*1180px/s);
     assert.match(css, /\.results-layout\s*\{[^}]*grid-template-columns:\s*minmax\(640px,\s*1fr\)\s+minmax\(280px,\s*340px\)/s);
   });
+
+  it('renders map pins as large visible blocks', () => {
+    const css = readFileSync('gdebenz_ui/static/style.css', 'utf8');
+
+    assert.match(css, /\.result-map-marker\s*\{[^}]*display:\s*block/s);
+    assert.match(css, /\.result-map-marker\s*\{[^}]*width:\s*24px\s*!important/s);
+    assert.match(css, /\.result-map-marker\s*\{[^}]*height:\s*24px\s*!important/s);
+  });
 });
