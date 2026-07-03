@@ -211,6 +211,39 @@ describe('frontend DOM updates', () => {
     assert.equal(fetchLog[0].options.headers['x-access-session'], 'session-123');
   });
 
+  it('creates a page-load presence session and includes it in presence POSTs', async () => {
+    const { context, dom, fetchLog } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        fetchLog.push({ url: String(url), options });
+        if (String(url) === '/api/presence') return { ok: true, json: async () => ({ users: [] }) };
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    try {
+      vm.runInContext(`
+        state.pendingAvatar = '/avatars/a.png';
+        document.getElementById('identity-handle').value = 'Operator';
+        saveIdentity(new window.Event('submit'));
+      `, context);
+      await vm.runInContext('postPresence()', context);
+
+      const identity = vm.runInContext('state.identity', context);
+      const presencePost = fetchLog
+        .filter((entry) => entry.url === '/api/presence' && entry.options.method === 'POST')
+        .at(-1);
+      const payload = JSON.parse(presencePost?.options.body || '{}');
+
+      assert.equal(Boolean(identity.sessionId), true);
+      assert.equal(Number.isFinite(identity.sessionStartedAt), true);
+      assert.equal(payload.clientId, identity.clientId);
+      assert.equal(payload.sessionId, identity.sessionId);
+      assert.equal(payload.sessionStartedAt, identity.sessionStartedAt);
+    } finally {
+      vm.runInContext('stopPresenceTimers()', context);
+    }
+  });
+
   it('keeps split vote counters after updating vote button state', () => {
     const { context, dom } = loadFrontendHarness();
 

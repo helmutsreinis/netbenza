@@ -387,10 +387,39 @@ function readIdentity() {
   try {
     const saved = JSON.parse(localStorage.getItem(IDENTITY_KEY) || 'null');
     if (!saved?.clientId || !saved?.handle || !saved?.avatar) return null;
-    return saved;
+    return withPresenceSession(saved);
   } catch {
     return null;
   }
+}
+
+function withPresenceSession(identity) {
+  return {
+    clientId: identity.clientId,
+    fingerprint: identity.fingerprint || randomHex(16),
+    handle: identity.handle,
+    avatar: identity.avatar,
+    sessionId: randomId(),
+    sessionStartedAt: Date.now(),
+  };
+}
+
+function persistedIdentity(identity) {
+  return {
+    clientId: identity.clientId,
+    fingerprint: identity.fingerprint,
+    handle: identity.handle,
+    avatar: identity.avatar,
+  };
+}
+
+function ensurePresenceSession() {
+  if (!state.identity) return null;
+  if (state.identity.sessionId && Number.isFinite(Number(state.identity.sessionStartedAt))) {
+    return state.identity;
+  }
+  state.identity = withPresenceSession(state.identity);
+  return state.identity;
 }
 
 function saveIdentity(event) {
@@ -406,13 +435,13 @@ function saveIdentity(event) {
   }
 
   const previous = state.identity || {};
-  state.identity = {
+  state.identity = withPresenceSession({
     clientId: previous.clientId || randomId(),
     fingerprint: previous.fingerprint || randomHex(16),
     handle: handle.slice(0, 32),
     avatar: state.pendingAvatar,
-  };
-  localStorage.setItem(IDENTITY_KEY, JSON.stringify(state.identity));
+  });
+  localStorage.setItem(IDENTITY_KEY, JSON.stringify(persistedIdentity(state.identity)));
   $('#identity-modal').hidden = true;
   renderIdentityBadge();
   startPresence();
@@ -585,15 +614,18 @@ function requestPresenceSync(force = false) {
 }
 
 async function postPresence() {
-  if (!state.identity) return;
+  const identity = ensurePresenceSession();
+  if (!identity) return;
   state.lastPresencePost = Date.now();
   try {
     const data = await api('/api/presence', {
       method: 'POST',
       body: JSON.stringify({
-        clientId: state.identity.clientId,
-        handle: state.identity.handle,
-        avatar: state.identity.avatar,
+        clientId: identity.clientId,
+        sessionId: identity.sessionId,
+        sessionStartedAt: identity.sessionStartedAt,
+        handle: identity.handle,
+        avatar: identity.avatar,
         activity: state.activity,
         detail: state.activityDetail,
       }),
@@ -605,9 +637,14 @@ async function postPresence() {
 }
 
 async function pollPresence() {
-  if (!state.identity) return;
+  const identity = ensurePresenceSession();
+  if (!identity) return;
   try {
-    const data = await api('/api/presence');
+    const params = new URLSearchParams({
+      clientId: identity.clientId,
+      sessionId: identity.sessionId,
+    });
+    const data = await api(`/api/presence?${params}`);
     renderOnlineUsers(data.users || []);
   } catch {
     renderOnlineUsers(state.presenceUsers);
@@ -615,8 +652,13 @@ async function pollPresence() {
 }
 
 function leavePresence() {
-  if (!state.identity) return;
-  fetch(`/api/presence?clientId=${encodeURIComponent(state.identity.clientId)}`, {
+  const identity = ensurePresenceSession();
+  if (!identity) return;
+  const params = new URLSearchParams({
+    clientId: identity.clientId,
+    sessionId: identity.sessionId,
+  });
+  fetch(`/api/presence?${params}`, {
     method: 'DELETE',
     headers: accessHeaders(),
     keepalive: true,
