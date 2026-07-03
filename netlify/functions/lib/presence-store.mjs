@@ -2,6 +2,7 @@ import { getStore } from '@netlify/blobs';
 import { requestIpKey } from './request-context.mjs';
 
 export const ACTIVE_WINDOW_MS = 25_000;
+const HISTORY_LIMIT = 24;
 
 const ALLOWED_ACTIVITIES = new Set([
   'online',
@@ -41,7 +42,7 @@ export function normalizePresenceBody(body = {}) {
 
   return {
     clientId,
-    sessionId: normalizeSessionId(body.sessionId || clientId),
+    sessionId: normalizeSessionId(body.sessionId),
     handle: clip(body.handle, 32) || 'Anonymous',
     avatar: avatar.startsWith('/avatars/') || avatar.startsWith('/static/avatars/') ? avatar : '',
     activity,
@@ -52,7 +53,7 @@ export function normalizePresenceBody(body = {}) {
 export function createPresenceRecord(normalized, now = Date.now()) {
   return {
     clientId: normalized.clientId,
-    sessionId: normalizeSessionId(normalized.sessionId || normalized.clientId),
+    sessionId: normalizeSessionId(normalized.sessionId),
     handle: normalized.handle,
     avatar: normalized.avatar,
     activity: normalized.activity,
@@ -98,6 +99,14 @@ export function presenceKey(clientId) {
   return `users/${clientId}`;
 }
 
+export function clientSessionKey(clientId) {
+  return `clients/${clientId}`;
+}
+
+export function ipSessionKey(ipKey) {
+  return `ips/${ipKey}`;
+}
+
 function isActiveRecord(record, now) {
   if (!record?.clientId) return false;
   const lastSeen = Number(record.lastSeen);
@@ -115,6 +124,96 @@ function publicUser(record) {
   };
 }
 
+function rememberValue(values = [], value = '') {
+  const current = Array.isArray(values) ? values.filter(Boolean) : [];
+  const next = value ? [value, ...current.filter((item) => item !== value)] : current;
+  return next.slice(0, HISTORY_LIMIT);
+}
+
+function identityToken(identity) {
+  return `${identity.clientId}\n${identity.sessionId}`;
+}
+
+function sameIdentity(left, right) {
+  return Boolean(
+    left?.clientId &&
+    left?.sessionId &&
+    right?.clientId &&
+    right?.sessionId &&
+    left.clientId === right.clientId &&
+    left.sessionId === right.sessionId,
+  );
+}
+
+function activeIdentityFromIpState(state) {
+  if (!state?.activeClientId || !state?.activeSessionId) return null;
+  return {
+    clientId: state.activeClientId,
+    sessionId: state.activeSessionId,
+  };
+}
+
+function hasRememberedSession(state, sessionId) {
+  return Array.isArray(state?.replacedSessionIds) && state.replacedSessionIds.includes(sessionId);
+}
+
+function hasRememberedIdentity(state, identity) {
+  return Array.isArray(state?.replacedIdentities) && state.replacedIdentities.includes(identityToken(identity));
+}
+
+async function readStoreJson(store, key) {
+  return store.get(key, { type: 'json' }).catch(() => null);
+}
+
+async function readClientState(store, clientId) {
+  return readStoreJson(store, clientSessionKey(clientId));
+}
+
+async function readIpState(store, ipKey) {
+  if (!ipKey) return null;
+  return readStoreJson(store, ipSessionKey(ipKey));
+}
+
+function normalizeRecordIdentity(record) {
+  try {
+    const clientId = normalizeClientId(record.clientId);
+    const sessionId = normalizeSessionId(record.sessionId);
+    const ipKey = typeof record.ipKey === 'string' ? record.ipKey : '';
+    if (!ipKey) return null;
+    return { clientId, sessionId, ipKey };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeViewer(viewer) {
+  try {
+    const clientId = normalizeClientId(viewer?.clientId);
+    const sessionId = normalizeSessionId(viewer?.sessionId);
+    const ipKey = typeof viewer?.ipKey === 'string' ? viewer.ipKey : '';
+    if (!ipKey) return null;
+    return { clientId, sessionId, ipKey };
+  } catch {
+    return null;
+  }
+}
+
+async function isCurrentActiveRecord(store, record, now) {
+  if (!isActiveRecord(record, now)) return false;
+  const identity = normalizeRecordIdentity(record);
+  if (!identity) return false;
+
+  const [clientState, ipState] = await Promise.all([
+    readClientState(store, identity.clientId),
+    readIpState(store, identity.ipKey),
+  ]);
+
+  return (
+    clientState?.activeSessionId === identity.sessionId &&
+    sameIdentity(activeIdentityFromIpState(ipState), identity)
+  );
+}
+
 async function activePresenceEntries(store, now = Date.now()) {
   const { blobs = [] } = await store.list({ prefix: 'users/' });
   const entries = [];
@@ -126,49 +225,55 @@ async function activePresenceEntries(store, now = Date.now()) {
       await store.delete(blob.key).catch(() => {});
       return;
     }
-    entries.push({ key: blob.key, record });
+    if (await isCurrentActiveRecord(store, record, now)) {
+      entries.push({ key: blob.key, record });
+    }
   }));
 
   return entries;
 }
 
-function normalizeViewer(viewer) {
-  if (!viewer?.clientId || !viewer?.sessionId) return null;
-  try {
-    return {
-      clientId: normalizeClientId(viewer.clientId),
-      sessionId: normalizeSessionId(viewer.sessionId),
-      ipKey: typeof viewer.ipKey === 'string' ? viewer.ipKey : '',
-    };
-  } catch {
-    return null;
-  }
-}
-
-function sessionStatusFromEntries(entries, viewer) {
+async function sessionStatusFromStore(store, viewer, now) {
   const identity = normalizeViewer(viewer);
-  if (!identity) return null;
+  if (!identity) return { active: false, reason: 'invalid_session' };
 
-  const ownEntry = entries.find(({ record }) => record.clientId === identity.clientId);
-  if (ownEntry) {
-    return ownEntry.record.sessionId === identity.sessionId
-      ? { active: true }
-      : { active: false, reason: 'client_replaced' };
+  const [clientState, ipState, record] = await Promise.all([
+    readClientState(store, identity.clientId),
+    readIpState(store, identity.ipKey),
+    readStoreJson(store, presenceKey(identity.clientId)),
+  ]);
+  const ipActive = activeIdentityFromIpState(ipState);
+
+  if (clientState?.activeSessionId && clientState.activeSessionId !== identity.sessionId) {
+    return { active: false, reason: 'client_replaced' };
   }
 
-  if (identity.ipKey) {
-    const ipReplacement = entries.find(({ record }) => (
-      record.ipKey === identity.ipKey && record.clientId !== identity.clientId
-    ));
-    if (ipReplacement) return { active: false, reason: 'ip_replaced' };
+  if (!clientState?.activeSessionId) {
+    if (ipActive && !sameIdentity(ipActive, identity)) return { active: false, reason: 'ip_replaced' };
+    return { active: false, reason: 'not_found' };
   }
 
-  return { active: false, reason: 'not_found' };
+  if (ipActive && !sameIdentity(ipActive, identity)) {
+    return { active: false, reason: 'ip_replaced' };
+  }
+
+  if (!ipActive) return { active: false, reason: 'not_found' };
+
+  const recordIdentity = normalizeRecordIdentity(record || {});
+  if (
+    !recordIdentity ||
+    !sameIdentity(recordIdentity, identity) ||
+    recordIdentity.ipKey !== identity.ipKey ||
+    !isActiveRecord(record, now)
+  ) {
+    return { active: false, reason: 'not_found' };
+  }
+
+  return { active: true };
 }
 
 export async function activeSessionStatus(store, viewer, now = Date.now()) {
-  const entries = await activePresenceEntries(store, now);
-  return sessionStatusFromEntries(entries, viewer) || { active: true };
+  return sessionStatusFromStore(store, viewer, now);
 }
 
 export async function assertActiveSession(store, identity, now = Date.now()) {
@@ -191,8 +296,7 @@ export async function presenceSnapshot(store, now = Date.now(), viewer = null) {
     activeWindowMs: ACTIVE_WINDOW_MS,
     serverTime: now,
   };
-  const session = sessionStatusFromEntries(entries, viewer);
-  if (session) snapshot.session = session;
+  if (viewer) snapshot.session = await sessionStatusFromStore(store, viewer, now);
   return snapshot;
 }
 
@@ -227,12 +331,91 @@ function viewerFromRequest(req) {
   return { clientId, sessionId, ipKey: requestIpKey(req) };
 }
 
-async function replaceSameIpProfiles(store, identity, now) {
-  if (!identity.ipKey) return;
-  const entries = await activePresenceEntries(store, now);
-  await Promise.all(entries
-    .filter(({ record }) => record.ipKey === identity.ipKey && record.clientId !== identity.clientId)
-    .map(({ key }) => store.delete(key).catch(() => {})));
+async function applyPresencePost(store, identity, now) {
+  const [clientState, ipState] = await Promise.all([
+    readClientState(store, identity.clientId),
+    readIpState(store, identity.ipKey),
+  ]);
+  const ipActive = activeIdentityFromIpState(ipState);
+
+  if (clientState?.activeSessionId && clientState.activeSessionId !== identity.sessionId) {
+    if (hasRememberedSession(clientState, identity.sessionId)) {
+      return { active: false, reason: 'client_replaced' };
+    }
+  } else if (!clientState?.activeSessionId && hasRememberedSession(clientState, identity.sessionId)) {
+    return { active: false, reason: 'client_replaced' };
+  }
+
+  if (hasRememberedIdentity(ipState, identity)) {
+    return { active: false, reason: 'ip_replaced' };
+  }
+
+  if (clientState?.activeSessionId === identity.sessionId && ipActive && !sameIdentity(ipActive, identity)) {
+    return { active: false, reason: 'ip_replaced' };
+  }
+
+  const previousClientSession = (
+    clientState?.activeSessionId &&
+    clientState.activeSessionId !== identity.sessionId
+  ) ? clientState.activeSessionId : '';
+  const previousIpIdentity = ipActive && !sameIdentity(ipActive, identity) ? ipActive : null;
+
+  await store.setJSON(clientSessionKey(identity.clientId), {
+    clientId: identity.clientId,
+    activeSessionId: identity.sessionId,
+    replacedSessionIds: rememberValue(clientState?.replacedSessionIds, previousClientSession),
+    updatedAt: now,
+  });
+  await store.setJSON(ipSessionKey(identity.ipKey), {
+    ipKey: identity.ipKey,
+    activeClientId: identity.clientId,
+    activeSessionId: identity.sessionId,
+    replacedIdentities: rememberValue(
+      ipState?.replacedIdentities,
+      previousIpIdentity ? identityToken(previousIpIdentity) : '',
+    ),
+    updatedAt: now,
+  });
+  await store.setJSON(presenceKey(identity.clientId), createPresenceRecord(identity, now));
+
+  if (previousIpIdentity && previousIpIdentity.clientId !== identity.clientId) {
+    await store.delete(presenceKey(previousIpIdentity.clientId)).catch(() => {});
+  }
+
+  return { active: true };
+}
+
+async function deleteActivePresence(store, viewer, now) {
+  const identity = normalizeViewer(viewer);
+  if (!identity) return { active: false, reason: 'invalid_session' };
+
+  const status = await activeSessionStatus(store, identity, now);
+  if (!status.active) return status;
+
+  const [clientState, ipState] = await Promise.all([
+    readClientState(store, identity.clientId),
+    readIpState(store, identity.ipKey),
+  ]);
+
+  await store.delete(presenceKey(identity.clientId)).catch(() => {});
+  await store.setJSON(clientSessionKey(identity.clientId), {
+    clientId: identity.clientId,
+    activeSessionId: '',
+    replacedSessionIds: rememberValue(clientState?.replacedSessionIds, identity.sessionId),
+    updatedAt: now,
+  });
+
+  if (sameIdentity(activeIdentityFromIpState(ipState), identity)) {
+    await store.setJSON(ipSessionKey(identity.ipKey), {
+      ipKey: identity.ipKey,
+      activeClientId: '',
+      activeSessionId: '',
+      replacedIdentities: rememberValue(ipState?.replacedIdentities, identityToken(identity)),
+      updatedAt: now,
+    });
+  }
+
+  return { active: false, reason: 'not_found' };
 }
 
 export async function handlePresenceRequest(req, store = getPresenceStore(), nowFn = Date.now) {
@@ -246,27 +429,16 @@ export async function handlePresenceRequest(req, store = getPresenceStore(), now
     try {
       const normalized = normalizePresenceBody(await readJson(req));
       const identity = { ...normalized, ipKey: requestIpKey(req) };
-      await replaceSameIpProfiles(store, identity, now);
-      await store.setJSON(presenceKey(identity.clientId), createPresenceRecord(identity, now));
-      return json(await presenceSnapshot(store, now));
+      await applyPresencePost(store, identity, now);
+      return json(await presenceSnapshot(store, now, identity));
     } catch (error) {
       return json({ detail: error.message || 'Invalid presence payload' }, { status: 400 });
     }
   }
 
   if (req.method === 'DELETE') {
-    const url = new URL(req.url);
-    const clientId = url.searchParams.get('clientId');
-    const sessionId = url.searchParams.get('sessionId');
     const viewer = viewerFromRequest(req);
-    if (clientId) {
-      if (sessionId) {
-        const status = await activeSessionStatus(store, viewer, now);
-        if (status.active) await store.delete(presenceKey(normalizeClientId(clientId))).catch(() => {});
-      } else {
-        await store.delete(presenceKey(normalizeClientId(clientId))).catch(() => {});
-      }
-    }
+    await deleteActivePresence(store, viewer, now);
     return json(await presenceSnapshot(store, now, viewer));
   }
 
