@@ -108,6 +108,34 @@
     <div id="stats-selected"></div>
   </section>
 
+  <!-- Collaboration -->
+  <section class="panel collaboration-panel" id="collaboration-panel">
+    <div class="collab-section queue-section">
+      <div class="collab-head">
+        <div>
+          <span class="collab-kicker">Public queue</span>
+          <strong>Vote traffic</strong>
+        </div>
+        <span id="vote-queue-count" class="collab-count">0</span>
+      </div>
+      <div id="vote-queue-list" class="vote-queue-list" aria-live="polite"></div>
+    </div>
+    <div class="collab-section chat-section">
+      <div class="collab-head">
+        <div>
+          <span class="collab-kicker">Team chat</span>
+          <strong>Operators</strong>
+        </div>
+        <span id="chat-count" class="collab-count">0</span>
+      </div>
+      <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+      <form id="chat-form" class="chat-form">
+        <input id="chat-input" type="text" maxlength="240" placeholder="Message the room..." autocomplete="off">
+        <button id="chat-send" class="btn btn-sm btn-primary" type="submit">Send</button>
+      </form>
+    </div>
+  </section>
+
   <!-- Pagination -->
   <section class="pagination" id="pagination" style="display:none">
     <button class="btn btn-sm btn-ghost" id="page-prev">◀ Prev</button>
@@ -222,6 +250,15 @@
     </div>
     <button id="identity-save" class="btn btn-primary" type="submit">Enter</button>
   </form>
+</div>
+
+<!-- Replaced session -->
+<div id="session-replaced-modal" class="session-replaced-modal" hidden>
+  <div class="session-replaced-card" role="alertdialog" aria-modal="true" aria-labelledby="session-replaced-title">
+    <div class="session-replaced-kicker">Session replaced</div>
+    <div id="session-replaced-title" class="session-replaced-title">This browser session is no longer active</div>
+    <p id="session-replaced-reason" class="session-replaced-reason"></p>
+  </div>
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>

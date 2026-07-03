@@ -11,9 +11,19 @@ const IDENTITY_KEY = 'gdebenz.identity.v1';
 const PRESENCE_HEARTBEAT_MS = 5000;
 const PRESENCE_POLL_MS = 4000;
 const PRESENCE_PUSH_MIN_MS = 1500;
+const QUEUE_POLL_MS = 2500;
+const CHAT_POLL_MS = 3000;
 const ACTIVITY_IDLE_MS = 15000;
+const MAX_HEADER_ROSTER_USERS = 6;
 const POTEMKIN_STANDBY_MESSAGE = 'Live station data is unavailable for a moment. Try again shortly.';
 const RESULT_MAP_PIN_COLOR = '#7F1D1D';
+const SESSION_REPLACED_REASONS = new Set([
+  'client_replaced',
+  'ip_replaced',
+  'invalid_session',
+  'inactive_session',
+  'not_found',
+]);
 const POTEMKIN_VIDEO_FILES = [
   '17798970387630865084.mp4',
   '7OZ3wCRuoxyton22.mp4',
@@ -66,6 +76,12 @@ const state = {
   presenceHeartbeat: null,
   presencePoll: null,
   presencePushTimer: null,
+  voteQueuePoll: null,
+  chatPoll: null,
+  voteQueueEntries: [],
+  chatMessages: [],
+  sessionBlocked: false,
+  sessionBlockReason: '',
   lastPresencePost: 0,
   idleTimer: null,
   stations: [],          // stations on current page
@@ -113,10 +129,16 @@ async function api(path, opts = {}) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    const error = new Error(err.detail || res.statusText);
+    const detail = err.detail || res.statusText;
+    const error = new Error(detail);
+    error.status = res.status;
+    error.detail = detail;
     if (res.status === 401) {
       error.accessDenied = true;
       await showAccessGateAfterDenied();
+    }
+    if (res.status === 409 && isSessionReplacementReason(detail)) {
+      blockReplacedSession(detail);
     }
     throw error;
   }
@@ -129,6 +151,7 @@ async function init() {
   state.source = 'gdebenz';
 
   initServiceLauncher();
+  bindCollaborationPanel();
   initAccessGate();
 
   // City dropdown → auto search
@@ -362,6 +385,7 @@ function initIdentityGate() {
   renderAvatarGrid();
   renderIdentityBadge();
   renderOnlineUsers([]);
+  updateChatFormState();
 
   if (!state.identityGateInitialized) {
     $('#identity-form').addEventListener('submit', saveIdentity);
@@ -414,6 +438,7 @@ function persistedIdentity(identity) {
 }
 
 function ensurePresenceSession() {
+  if (state.sessionBlocked) return null;
   if (!state.identity) return null;
   if (state.identity.sessionId && Number.isFinite(Number(state.identity.sessionStartedAt))) {
     return state.identity;
@@ -422,7 +447,7 @@ function ensurePresenceSession() {
   return state.identity;
 }
 
-function voteIdentityPayload() {
+function identityPayload() {
   const identity = ensurePresenceSession();
   if (!identity) return {};
   return {
@@ -431,6 +456,10 @@ function voteIdentityPayload() {
     handle: identity.handle,
     avatar: identity.avatar,
   };
+}
+
+function voteIdentityPayload() {
+  return identityPayload();
 }
 
 function saveIdentity(event) {
@@ -455,6 +484,7 @@ function saveIdentity(event) {
   localStorage.setItem(IDENTITY_KEY, JSON.stringify(persistedIdentity(state.identity)));
   $('#identity-modal').hidden = true;
   renderIdentityBadge();
+  updateChatFormState();
   startPresence();
   showServicePicker();
 }
@@ -578,9 +608,11 @@ function randomHex(bytes) {
 }
 
 function startPresence() {
+  if (state.sessionBlocked) return;
   stopPresenceTimers();
   postPresence(true);
   pollPresence();
+  startCollaborationPolling();
   state.presenceHeartbeat = setInterval(() => postPresence(true), PRESENCE_HEARTBEAT_MS);
   state.presencePoll = setInterval(pollPresence, PRESENCE_POLL_MS);
 }
@@ -589,13 +621,14 @@ function stopPresenceTimers() {
   clearInterval(state.presenceHeartbeat);
   clearInterval(state.presencePoll);
   clearTimeout(state.presencePushTimer);
+  stopCollaborationTimers();
   state.presenceHeartbeat = null;
   state.presencePoll = null;
   state.presencePushTimer = null;
 }
 
 function setActivity(activity, detail = '', force = false) {
-  if (!state.identity) return;
+  if (!state.identity || state.sessionBlocked) return;
   state.activity = activity;
   state.activityDetail = detail;
   requestPresenceSync(force);
@@ -611,6 +644,7 @@ function setActivity(activity, detail = '', force = false) {
 }
 
 function requestPresenceSync(force = false) {
+  if (state.sessionBlocked) return;
   if (force || Date.now() - state.lastPresencePost >= PRESENCE_PUSH_MIN_MS) {
     clearTimeout(state.presencePushTimer);
     state.presencePushTimer = null;
@@ -626,7 +660,7 @@ function requestPresenceSync(force = false) {
 
 async function postPresence() {
   const identity = ensurePresenceSession();
-  if (!identity) return;
+  if (!identity || state.sessionBlocked) return;
   state.lastPresencePost = Date.now();
   try {
     const data = await api('/api/presence', {
@@ -641,30 +675,32 @@ async function postPresence() {
         detail: state.activityDetail,
       }),
     });
-    renderOnlineUsers(data.users || []);
-  } catch {
+    handlePresencePayload(data);
+  } catch (e) {
+    if (isSessionReplacementError(e)) return;
     renderOnlineUsers(state.presenceUsers);
   }
 }
 
 async function pollPresence() {
   const identity = ensurePresenceSession();
-  if (!identity) return;
+  if (!identity || state.sessionBlocked) return;
   try {
     const params = new URLSearchParams({
       clientId: identity.clientId,
       sessionId: identity.sessionId,
     });
     const data = await api(`/api/presence?${params}`);
-    renderOnlineUsers(data.users || []);
-  } catch {
+    handlePresencePayload(data);
+  } catch (e) {
+    if (isSessionReplacementError(e)) return;
     renderOnlineUsers(state.presenceUsers);
   }
 }
 
 function leavePresence() {
   const identity = ensurePresenceSession();
-  if (!identity) return;
+  if (!identity || state.sessionBlocked) return;
   const params = new URLSearchParams({
     clientId: identity.clientId,
     sessionId: identity.sessionId,
@@ -686,7 +722,9 @@ function renderOnlineUsers(users) {
     return;
   }
 
-  el.innerHTML = state.presenceUsers.map((user) => `
+  const visibleUsers = state.presenceUsers.slice(0, MAX_HEADER_ROSTER_USERS);
+  const overflow = state.presenceUsers.length - visibleUsers.length;
+  el.innerHTML = visibleUsers.map((user) => `
     <div class="online-user" title="${esc(user.handle)} · ${esc(activityLabel(user.activity, user.detail))}">
       ${user.avatar ? `<img src="${esc(user.avatar)}" alt="">` : ''}
       <span class="online-copy">
@@ -694,7 +732,7 @@ function renderOnlineUsers(users) {
         <span class="online-activity">${esc(activityLabel(user.activity, user.detail))}</span>
       </span>
     </div>
-  `).join('');
+  `).join('') + (overflow > 0 ? `<span class="online-more" title="${overflow} more online">+${overflow}</span>` : '');
 }
 
 function activityLabel(activity, detail = '') {
@@ -708,6 +746,227 @@ function activityLabel(activity, detail = '') {
     idle: 'Idle',
   };
   return detail ? `${labels[activity] || 'Online'}: ${detail}` : (labels[activity] || 'Online');
+}
+
+function handlePresencePayload(data = {}) {
+  renderOnlineUsers(data.users || []);
+  if (data.session?.active === false) {
+    blockReplacedSession(data.session.reason || 'inactive_session');
+    return false;
+  }
+  return true;
+}
+
+function isSessionReplacementReason(reason) {
+  return SESSION_REPLACED_REASONS.has(String(reason || ''));
+}
+
+function isSessionReplacementError(error) {
+  const detail = error?.detail || error?.message || error;
+  if (isSessionReplacementReason(detail)) return true;
+  return Number(error?.status) === 409 && /replaced|invalid_session|inactive_session|not_found/.test(String(detail || ''));
+}
+
+function blockReplacedSession(reason = 'inactive_session') {
+  if (state.sessionBlocked && state.sessionBlockReason === reason) return;
+  state.sessionBlocked = true;
+  state.sessionBlockReason = String(reason || 'inactive_session');
+  stopPresenceTimers();
+  clearTimeout(state.idleTimer);
+  state.idleTimer = null;
+
+  const modal = $('#session-replaced-modal');
+  const reasonEl = $('#session-replaced-reason');
+  if (reasonEl) {
+    reasonEl.textContent = `Reason: ${state.sessionBlockReason}. Reload this page to start a fresh session.`;
+  }
+  if (modal) modal.hidden = false;
+  document.body.classList.add('session-blocked');
+  updateVoteBtn();
+  updateChatFormState();
+}
+
+function canUseSessionActions() {
+  return !state.sessionBlocked && Boolean(ensurePresenceSession());
+}
+
+function bindCollaborationPanel() {
+  const form = $('#chat-form');
+  if (form && form.dataset.boundChatForm !== 'true') {
+    form.dataset.boundChatForm = 'true';
+    form.addEventListener('submit', sendChatMessage);
+  }
+  renderVoteQueue({ entries: [], processing: null });
+  renderChatMessages([]);
+  updateChatFormState();
+}
+
+function startCollaborationPolling() {
+  stopCollaborationTimers();
+  if (!canUseSessionActions()) return;
+  pollQueue();
+  pollChat();
+  state.voteQueuePoll = setInterval(pollQueue, QUEUE_POLL_MS);
+  state.chatPoll = setInterval(pollChat, CHAT_POLL_MS);
+}
+
+function stopCollaborationTimers() {
+  clearInterval(state.voteQueuePoll);
+  clearInterval(state.chatPoll);
+  state.voteQueuePoll = null;
+  state.chatPoll = null;
+}
+
+async function pollQueue() {
+  if (!canUseSessionActions()) return;
+  try {
+    const data = await api('/api/vote/queue');
+    renderVoteQueue(data);
+  } catch (e) {
+    if (isSessionReplacementError(e)) return;
+  }
+}
+
+function renderVoteQueue(data = {}) {
+  const list = $('#vote-queue-list');
+  const count = $('#vote-queue-count');
+  if (!list) return;
+
+  const entries = Array.isArray(data.entries) ? data.entries : [];
+  const rows = [];
+  if (data.processing) rows.push({ ...data.processing, state: 'processing', position: 0 });
+  entries.forEach((entry, index) => rows.push({ ...entry, state: entry.state || 'queued', position: entry.position || index + 1 }));
+
+  state.voteQueueEntries = rows;
+  if (count) count.textContent = String(rows.length);
+
+  if (!rows.length) {
+    list.innerHTML = '<div class="collab-empty">Queue idle</div>';
+    return;
+  }
+
+  list.innerHTML = rows.map(renderVoteQueueItem).join('');
+}
+
+function renderVoteQueueItem(entry) {
+  const isProcessing = entry.state === 'processing';
+  const handle = entry.handle || 'Anonymous';
+  const avatar = entry.avatar || '';
+  const source = entry.source || 'gdebenz';
+  const station = entry.stationId || entry.osmId || entry.osm_id || entry.station || '';
+  const status = entry.status || entry.voteStatus || '';
+  const position = isProcessing ? 'Processing' : `#${entry.position || '?'}`;
+
+  return `
+    <article class="vote-queue-item ${isProcessing ? 'is-processing' : ''}">
+      ${avatar ? `<img class="collab-avatar" src="${esc(avatar)}" alt="">` : '<span class="collab-avatar collab-avatar-empty"></span>'}
+      <div class="collab-copy">
+        <div class="collab-line">
+          <strong>${esc(handle)}</strong>
+          <span class="queue-position">${esc(position)}</span>
+        </div>
+        <div class="collab-meta">
+          <span>${esc(source)}</span>
+          <span>${esc(status)}</span>
+          <span>Station ${esc(station)}</span>
+        </div>
+      </div>
+    </article>
+  `;
+}
+
+async function pollChat() {
+  if (!canUseSessionActions()) return;
+  try {
+    const data = await api('/api/chat');
+    renderChatMessages(data.messages || []);
+  } catch (e) {
+    if (isSessionReplacementError(e)) return;
+  }
+}
+
+async function sendChatMessage(event) {
+  event?.preventDefault?.();
+  if (!canUseSessionActions()) return;
+
+  const input = $('#chat-input');
+  const text = input?.value.trim() || '';
+  if (!text) return;
+
+  setChatSending(true);
+  try {
+    const data = await api('/api/chat', {
+      method: 'POST',
+      body: JSON.stringify({
+        ...identityPayload(),
+        text,
+      }),
+    });
+    input.value = '';
+    renderChatMessages(data.messages || []);
+  } catch (e) {
+    if (!isSessionReplacementError(e)) toast('Chat failed: ' + e.message);
+  } finally {
+    setChatSending(false);
+  }
+}
+
+function renderChatMessages(messages = []) {
+  const list = $('#chat-messages');
+  const count = $('#chat-count');
+  if (!list) return;
+
+  state.chatMessages = Array.isArray(messages) ? messages : [];
+  if (count) count.textContent = String(state.chatMessages.length);
+
+  if (!state.chatMessages.length) {
+    list.innerHTML = '<div class="collab-empty">No chat yet</div>';
+    return;
+  }
+
+  list.innerHTML = state.chatMessages.map((message) => {
+    const handle = message.handle || 'Anonymous';
+    const avatar = message.avatar || '';
+    const time = formatChatTime(message.createdAt);
+    return `
+      <article class="chat-message">
+        ${avatar ? `<img class="collab-avatar" src="${esc(avatar)}" alt="">` : '<span class="collab-avatar collab-avatar-empty"></span>'}
+        <div class="collab-copy">
+          <div class="collab-line">
+            <strong>${esc(handle)}</strong>
+            ${time ? `<span>${esc(time)}</span>` : ''}
+          </div>
+          <p>${esc(message.text || '')}</p>
+        </div>
+      </article>
+    `;
+  }).join('');
+  list.scrollTop = list.scrollHeight;
+}
+
+function setChatSending(isSending) {
+  const form = $('#chat-form');
+  const input = $('#chat-input');
+  if (!form) return;
+  $$('button', form).forEach((button) => { button.disabled = isSending || state.sessionBlocked; });
+  if (input) input.disabled = isSending || state.sessionBlocked;
+}
+
+function updateChatFormState() {
+  const input = $('#chat-input');
+  const form = $('#chat-form');
+  if (input) input.disabled = state.sessionBlocked || !state.identity;
+  if (form) $$('button', form).forEach((button) => { button.disabled = state.sessionBlocked || !state.identity; });
+}
+
+function formatChatTime(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
+  try {
+    return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
 }
 
 // ── Chips & Selects ────────────────────────────────
@@ -1177,13 +1436,38 @@ function updateSelectedCount() {
 function updateVoteBtn() {
   const hasStatus = !!$('#vote-status')?.value;
   const voteBtn = $('#vote-btn');
-  if (voteBtn) voteBtn.disabled = !hasStatus || state.totalFiltered === 0;
+  if (voteBtn) voteBtn.disabled = state.sessionBlocked || !hasStatus || state.totalFiltered === 0;
   const selBtn = $('#vote-selected-btn');
-  if (selBtn) selBtn.disabled = !hasStatus || state.allSelected.size === 0;
+  if (selBtn) selBtn.disabled = state.sessionBlocked || !hasStatus || state.allSelected.size === 0;
+}
+
+function shuffleIds(ids, rng = Math.random) {
+  const shuffled = [...(ids || [])];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
+}
+
+function buildVotePayload({ osmId, voteStatus, baseText, city, lat, lon }) {
+  return {
+    osm_ids: [osmId],
+    vote_status: voteStatus,
+    text: baseText,
+    on_site: $('#vote-onsite').checked,
+    city,
+    lat,
+    lon,
+    source: state.source || 'gdebenz',
+    fingerprint: state.identity?.fingerprint || state.identity?.clientId || '',
+    ...identityPayload(),
+  };
 }
 
 // ── Voting (ALL filtered stations across all pages) ──
 async function doVote() {
+  if (!canUseSessionActions()) return;
   const voteStatus = $('#vote-status').value;
   if (!voteStatus) return;
   setActivity('voting', 'Preparing', true);
@@ -1202,8 +1486,9 @@ async function doVote() {
   try {
     const idsParams = new URLSearchParams(state.searchParams.toString());
     const data = await api(`/api/stations/ids?${idsParams}`);
-    ids = data.ids;
+    ids = shuffleIds(data.ids || []);
   } catch (e) {
+    if (isSessionReplacementError(e)) return;
     toast('Failed to fetch station IDs: ' + e.message);
     btn.disabled = false;
     updateVoteBtn();
@@ -1243,6 +1528,7 @@ async function doVote() {
   const startTime = Date.now();
 
   for (let i = 0; i < total; i++) {
+    if (state.sessionBlocked) break;
     const osmId = ids[i];
 
     // Progress update
@@ -1265,16 +1551,7 @@ async function doVote() {
     try {
       const resp = await api('/api/vote', {
         method: 'POST',
-        body: JSON.stringify({
-          osm_ids: [osmId],
-          vote_status: voteStatus,
-          text: baseText,
-          on_site: $('#vote-onsite').checked,
-          city: city, lat: lat, lon: lon,
-          source: state.source || 'gdebenz',
-          fingerprint: state.identity?.fingerprint || state.identity?.clientId || '',
-          ...voteIdentityPayload(),
-        }),
+        body: JSON.stringify(buildVotePayload({ osmId, voteStatus, baseText, city, lat, lon })),
       });
       const r = resp[0] || { osm_id: osmId, name: osmId, success: false, reason: 'no response' };
       r.success ? ok++ : (r.reason === 'already voted' ? skip++ : fail++);
@@ -1282,6 +1559,7 @@ async function doVote() {
     } catch (e) {
       fail++;
       results.push({ osm_id: osmId, name: osmId, success: false, reason: e.message });
+      if (isSessionReplacementError(e)) break;
     }
   }
 
@@ -1295,7 +1573,7 @@ async function doVote() {
   btn.disabled = false;
   $('#vote-status').value = '';
   updateVoteBtn();
-  setActivity('done', `${ok} OK · ${fail} failed`, true);
+  if (!state.sessionBlocked) setActivity('done', `${ok} OK · ${fail} failed`, true);
   setTimeout(() => { progBar.style.display = 'none'; }, 10000);
   if (fail || skip) renderResults(results);
   else toast(`✅ All ${ok} votes sent!`);
@@ -1303,10 +1581,11 @@ async function doVote() {
 
 // ── Voting (selected stations only) ─────────────────
 async function doVoteSelected() {
+  if (!canUseSessionActions()) return;
   const voteStatus = $('#vote-status').value;
   if (!voteStatus || state.allSelected.size === 0) return;
 
-  const ids = [...state.allSelected];
+  const ids = shuffleIds([...state.allSelected]);
   const total = ids.length;
   const btn = $('#vote-selected-btn');
   btn.disabled = true;
@@ -1339,6 +1618,7 @@ async function doVoteSelected() {
   const startTime = Date.now();
 
   for (let i = 0; i < total; i++) {
+    if (state.sessionBlocked) break;
     const osmId = ids[i];
     const pct = Math.round((i / total) * 100);
     progFill.style.width = pct + '%';
@@ -1356,13 +1636,7 @@ async function doVoteSelected() {
     try {
       const resp = await api('/api/vote', {
         method: 'POST',
-        body: JSON.stringify({
-          osm_ids: [osmId], vote_status: voteStatus, text: baseText,
-          on_site: $('#vote-onsite').checked, city, lat, lon,
-          source: state.source || 'gdebenz',
-          fingerprint: state.identity?.fingerprint || state.identity?.clientId || '',
-          ...voteIdentityPayload(),
-        }),
+        body: JSON.stringify(buildVotePayload({ osmId, voteStatus, baseText, city, lat, lon })),
       });
       const r = resp[0] || { osm_id: osmId, name: osmId, success: false, reason: 'no response' };
       r.success ? ok++ : (r.reason === 'already voted' ? skip++ : fail++);
@@ -1370,6 +1644,7 @@ async function doVoteSelected() {
     } catch (e) {
       fail++;
       results.push({ osm_id: osmId, name: osmId, success: false, reason: e.message });
+      if (isSessionReplacementError(e)) break;
     }
   }
 
@@ -1388,7 +1663,7 @@ async function doVoteSelected() {
   updateSelectedCount();
   updateVoteBtn();
   $('#vote-status').value = '';
-  setActivity('done', `${ok} OK · ${fail} failed`, true);
+  if (!state.sessionBlocked) setActivity('done', `${ok} OK · ${fail} failed`, true);
   setTimeout(() => { progBar.style.display = 'none'; }, 10000);
   if (fail || skip) renderResults(results);
   else toast(`✅ All ${ok} votes sent!`);

@@ -54,6 +54,19 @@ function loadFrontendHarness(options = {}) {
     </div>
     <div id="stats-summary"></div>
     <div id="stats-selected"></div>
+    <section id="collaboration-panel">
+      <span id="vote-queue-count"></span>
+      <div id="vote-queue-list"></div>
+      <span id="chat-count"></span>
+      <div id="chat-messages"></div>
+      <form id="chat-form">
+        <input id="chat-input">
+        <button id="chat-send" type="submit">Send</button>
+      </form>
+    </section>
+    <div id="session-replaced-modal" hidden>
+      <div id="session-replaced-reason"></div>
+    </div>
     <button id="service-switch" hidden>Services</button>
     <div id="station-list"></div>
     <div id="stats-bar"></div>
@@ -273,6 +286,252 @@ describe('frontend DOM updates', () => {
     assert.equal(dom.window.document.getElementById('vote-sel-count')?.textContent, '2');
     assert.equal(dom.window.document.getElementById('vote-all-count')?.textContent, '12');
     assert.match(dom.window.document.getElementById('vote-btn')?.textContent || '', /12 filtered/);
+  });
+
+  it('renders public queue entries and processing state without private fields', () => {
+    const { context, dom } = loadFrontendHarness();
+
+    vm.runInContext(`
+      renderVoteQueue({
+        entries: [{
+          id: 'entry-one',
+          clientId: 'client-visible-but-not-needed',
+          handle: '<Queue Operator>',
+          avatar: '/avatars/queue.png',
+          source: 'benzin',
+          stationId: 'station-101',
+          status: 'available',
+          position: 1,
+          ipKey: 'ip:198.51.100.10',
+          sessionId: 'secret-session-one',
+          text: 'private text',
+          fingerprint: 'private-fingerprint',
+          privateVote: { vlat: 12.34, vlon: 56.78 }
+        }],
+        processing: {
+          id: 'entry-two',
+          handle: 'Processing User',
+          avatar: '/avatars/processing.png',
+          source: 'gdebenz',
+          stationId: 'station-202',
+          status: 'queue',
+          state: 'processing',
+          position: 0,
+          ipKey: 'ip:198.51.100.11',
+          sessionId: 'secret-session-two',
+          rawIp: '198.51.100.11',
+          coords: [12.34, 56.78]
+        }
+      });
+    `, context);
+
+    const list = dom.window.document.getElementById('vote-queue-list');
+    const rendered = list?.textContent || '';
+    const html = list?.innerHTML || '';
+
+    assert.match(rendered, /<Queue Operator>/);
+    assert.match(rendered, /Processing User/);
+    assert.match(rendered, /available/);
+    assert.match(rendered, /benzin/);
+    assert.match(rendered, /station-101/);
+    assert.match(rendered, /#1/);
+    assert.match(rendered, /Processing/);
+    assert.doesNotMatch(html, /<Queue Operator>/);
+    assert.doesNotMatch(html + rendered, /ip:198\.51\.100|secret-session|198\.51\.100\.11|private text|private-fingerprint|12\.34|56\.78/);
+    assert.equal(dom.window.document.getElementById('vote-queue-count')?.textContent, '2');
+  });
+
+  it('renders chat messages with escaped text', () => {
+    const { context, dom } = loadFrontendHarness();
+
+    vm.runInContext(`
+      renderChatMessages([{
+        id: 'message-one',
+        handle: 'Nina',
+        avatar: '/avatars/nina.png',
+        text: '<img src=x onerror=alert(1)> hello',
+        createdAt: 123
+      }]);
+    `, context);
+
+    const messages = dom.window.document.getElementById('chat-messages');
+    assert.match(messages?.textContent || '', /<img src=x onerror=alert\(1\)> hello/);
+    assert.doesNotMatch(messages?.innerHTML || '', /<img src=x/i);
+    assert.equal(dom.window.document.getElementById('chat-count')?.textContent, '1');
+  });
+
+  it('blocks stale replaced sessions from presence payloads and stops timers', () => {
+    const { context, dom } = loadFrontendHarness();
+
+    vm.runInContext(`
+      state.presenceHeartbeat = 1;
+      state.presencePoll = 2;
+      state.presencePushTimer = 3;
+      state.voteQueuePoll = 4;
+      state.chatPoll = 5;
+      handlePresencePayload({
+        users: [],
+        session: { active: false, reason: 'client_replaced' }
+      });
+    `, context);
+
+    assert.equal(vm.runInContext('state.sessionBlocked', context), true);
+    assert.equal(vm.runInContext('state.presenceHeartbeat', context), null);
+    assert.equal(vm.runInContext('state.presencePoll', context), null);
+    assert.equal(vm.runInContext('state.presencePushTimer', context), null);
+    assert.equal(vm.runInContext('state.voteQueuePoll', context), null);
+    assert.equal(vm.runInContext('state.chatPoll', context), null);
+    assert.equal(dom.window.document.getElementById('session-replaced-modal')?.hidden, false);
+    assert.match(dom.window.document.getElementById('session-replaced-reason')?.textContent || '', /client_replaced/);
+  });
+
+  it('shuffles ids deterministically with an injected random source', () => {
+    const { context } = loadFrontendHarness();
+
+    const shuffled = vm.runInContext("shuffleIds(['1', '2', '3', '4'], () => 0)", context);
+
+    assert.deepEqual([...shuffled], ['2', '3', '4', '1']);
+  });
+
+  it('builds vote payloads with active public identity and station fields', () => {
+    const { context } = loadFrontendHarness();
+
+    const payload = vm.runInContext(`
+      state.identity = {
+        clientId: 'client-build',
+        sessionId: 'session-build',
+        sessionStartedAt: 12345,
+        fingerprint: 'fingerprint-build',
+        handle: 'Build Operator',
+        avatar: '/avatars/build.png'
+      };
+      state.source = 'benzin';
+      document.getElementById('vote-onsite').checked = true;
+      buildVotePayload({
+        osmId: 'station-build',
+        voteStatus: 'available',
+        baseText: 'station text',
+        city: 'Kyiv',
+        lat: 50.45,
+        lon: 30.52
+      });
+    `, context);
+
+    assert.deepEqual([...payload.osm_ids], ['station-build']);
+    assert.equal(payload.vote_status, 'available');
+    assert.equal(payload.text, 'station text');
+    assert.equal(payload.city, 'Kyiv');
+    assert.equal(payload.lat, 50.45);
+    assert.equal(payload.lon, 30.52);
+    assert.equal(payload.on_site, true);
+    assert.equal(payload.source, 'benzin');
+    assert.equal(payload.fingerprint, 'fingerprint-build');
+    assert.equal(payload.clientId, 'client-build');
+    assert.equal(payload.sessionId, 'session-build');
+    assert.equal(payload.handle, 'Build Operator');
+    assert.equal(payload.avatar, '/avatars/build.png');
+    assert.equal(Object.hasOwn(payload, 'sessionStartedAt'), false);
+  });
+
+  it('posts chat with the active session identity and clears input after success', async () => {
+    const chatBodies = [];
+    const { context, dom } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        if (String(url) === '/api/chat' && options.method === 'POST') {
+          chatBodies.push(JSON.parse(options.body));
+          return {
+            ok: true,
+            json: async () => ({
+              messages: [{
+                id: 'message-ok',
+                clientId: 'client-chat',
+                handle: 'Chat Operator',
+                avatar: '/avatars/chat.png',
+                text: 'hello chat',
+                createdAt: 10,
+              }],
+            }),
+          };
+        }
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    vm.runInContext(`
+      state.identity = {
+        clientId: 'client-chat',
+        sessionId: 'session-chat',
+        sessionStartedAt: 12345,
+        fingerprint: 'fingerprint-chat',
+        handle: 'Chat Operator',
+        avatar: '/avatars/chat.png'
+      };
+      document.getElementById('chat-input').value = ' hello chat ';
+    `, context);
+
+    await vm.runInContext('sendChatMessage(new window.Event("submit"))', context);
+
+    assert.equal(chatBodies.length, 1);
+    assert.equal(chatBodies[0].clientId, 'client-chat');
+    assert.equal(chatBodies[0].sessionId, 'session-chat');
+    assert.equal(chatBodies[0].text, 'hello chat');
+    assert.equal(dom.window.document.getElementById('chat-input')?.value, '');
+    assert.match(dom.window.document.getElementById('chat-messages')?.textContent || '', /hello chat/);
+  });
+
+  it('uses shuffled ids and the vote payload helper in both vote loops', async () => {
+    const voteBodies = [];
+    const { context, dom } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        if (String(url).startsWith('/api/stations/ids')) {
+          return { ok: true, json: async () => ({ ids: ['1', '2', '3', '4'], total: 4 }) };
+        }
+        if (String(url) === '/api/vote') {
+          voteBodies.push(JSON.parse(options.body));
+          return { ok: true, json: async () => ([{ osm_id: JSON.parse(options.body).osm_ids[0], success: true }]) };
+        }
+        if (String(url) === '/api/presence') return { ok: true, json: async () => ({ users: [], session: { active: true } }) };
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    try {
+      vm.runInContext(`
+        Math.random = () => 0;
+        state.identity = {
+          clientId: 'client-vote',
+          sessionId: 'session-vote',
+          sessionStartedAt: 12345,
+          fingerprint: 'fingerprint-vote',
+          handle: 'Vote Operator',
+          avatar: '/avatars/vote.png'
+        };
+        state.searchParams = new URLSearchParams('source=gdebenz');
+        state.totalFiltered = 4;
+        state.source = 'gdebenz';
+        document.getElementById('vote-status').value = 'yes';
+        document.getElementById('comment-mode').value = 'custom';
+        document.getElementById('vote-text').value = 'queued text';
+      `, context);
+
+      await vm.runInContext('doVote()', context);
+
+      vm.runInContext(`
+        document.getElementById('vote-status').value = 'yes';
+        state.allSelected = new Set(['1', '2', '3', '4']);
+      `, context);
+      await vm.runInContext('doVoteSelected()', context);
+
+      assert.deepEqual(voteBodies.slice(0, 4).map((body) => body.osm_ids[0]), ['2', '3', '4', '1']);
+      assert.deepEqual(voteBodies.slice(4).map((body) => body.osm_ids[0]), ['2', '3', '4', '1']);
+      assert.equal(voteBodies.every((body) => body.clientId === 'client-vote'), true);
+      assert.equal(voteBodies.every((body) => body.sessionId === 'session-vote'), true);
+      assert.equal(voteBodies.every((body) => body.vote_status === 'yes'), true);
+      assert.equal(voteBodies.every((body) => body.text === 'queued text'), true);
+    } finally {
+      vm.runInContext('clearTimeout(state.idleTimer); stopPresenceTimers();', context);
+      dom.window.close();
+    }
   });
 
   it('includes active presence session identity in vote request payloads', async () => {
