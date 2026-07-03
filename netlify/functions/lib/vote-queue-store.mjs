@@ -3,9 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { getStore } from '@netlify/blobs';
 
 export const VOTE_INTERVAL_MS = 2000;
+export const PROCESSING_LEASE_MS = 30_000;
 
 const QUEUE_STATE_KEY = 'queue/state';
 const ACTIVE_STATES = new Set(['queued', 'processing']);
+const QUEUE_POLL_MS = 100;
+const DEFAULT_MAX_WAIT_MS = 60_000;
 
 export function getVoteQueueStore() {
   return getStore({ name: 'gdebenz-vote-queue', consistency: 'strong' });
@@ -56,7 +59,6 @@ function normalizeEntry(entry) {
   if (!entry?.id || !entry?.clientId || !entry?.ipKey) return null;
   const state = ACTIVE_STATES.has(entry.state) ? entry.state : 'queued';
   return {
-    ...entry,
     id: clippedString(entry.id, 120),
     clientId: clippedString(entry.clientId, 120),
     sessionId: clippedString(entry.sessionId, 160),
@@ -68,6 +70,7 @@ function normalizeEntry(entry) {
     status: clippedString(entry.status, 40),
     queuedAt: normalizeTimestamp(entry.queuedAt),
     processingAt: normalizeTimestamp(entry.processingAt),
+    processingLeaseUntil: normalizeTimestamp(entry.processingLeaseUntil),
     state,
     privateVote: clone(entry.privateVote || {}),
   };
@@ -85,16 +88,74 @@ function normalizeState(state) {
   };
 }
 
+function processingLeaseUntil(entry) {
+  return normalizeTimestamp(entry.processingLeaseUntil)
+    || (normalizeTimestamp(entry.processingAt) ? normalizeTimestamp(entry.processingAt) + PROCESSING_LEASE_MS : 0);
+}
+
+function cleanupStaleProcessing(state, now = Date.now()) {
+  const normalizedNow = normalizeTimestamp(now) || Date.now();
+  let changed = false;
+  let lastSubmissionAt = state.lastSubmissionAt;
+  let lastClientId = state.lastClientId;
+  const entries = [];
+
+  for (const entry of state.entries) {
+    if (entry.state !== 'processing') {
+      entries.push(entry);
+      continue;
+    }
+
+    const leaseUntil = processingLeaseUntil(entry);
+    if (leaseUntil && leaseUntil <= normalizedNow) {
+      changed = true;
+      const attemptedAt = normalizeTimestamp(entry.processingAt) || normalizedNow;
+      if (attemptedAt >= lastSubmissionAt) {
+        lastSubmissionAt = attemptedAt;
+        lastClientId = entry.clientId;
+      }
+      if (state.processingId === entry.id) state.processingId = '';
+      continue;
+    }
+
+    entries.push(entry);
+  }
+
+  const processingEntries = entries.filter((entry) => entry.state === 'processing');
+  let processingId = state.processingId;
+  if (processingId && !processingEntries.some((entry) => entry.id === processingId)) {
+    processingId = '';
+    changed = true;
+  }
+  if (!processingId && processingEntries.length) {
+    processingId = processingEntries[0].id;
+    changed = true;
+  }
+
+  return {
+    state: {
+      entries,
+      lastSubmissionAt,
+      lastClientId,
+      processingId,
+    },
+    changed,
+  };
+}
+
 async function writeQueueState(store, state) {
   const normalized = normalizeState(state);
   await store.setJSON(QUEUE_STATE_KEY, normalized);
   return normalized;
 }
 
-export async function readQueueState(store = getVoteQueueStore()) {
+export async function readQueueState(store = getVoteQueueStore(), now = Date.now()) {
   const state = await store.get(QUEUE_STATE_KEY, { type: 'json' }).catch(() => null);
   if (!state) return defaultQueueState();
-  return normalizeState(state);
+  const normalized = normalizeState(state);
+  const cleaned = cleanupStaleProcessing(normalized, now);
+  if (cleaned.changed) await writeQueueState(store, cleaned.state);
+  return cleaned.state;
 }
 
 export function createVoteQueueEntry({
@@ -119,6 +180,7 @@ export function createVoteQueueEntry({
     status: requiredString(status, 'status'),
     queuedAt: normalizeTimestamp(now) || Date.now(),
     processingAt: 0,
+    processingLeaseUntil: 0,
     state: 'queued',
     privateVote: clone(vote),
   };
@@ -135,11 +197,11 @@ function findActiveConflict(entries, entry) {
   return '';
 }
 
-export async function enqueueVoteEntry(store = getVoteQueueStore(), entry) {
+export async function enqueueVoteEntry(store = getVoteQueueStore(), entry, now = Date.now()) {
   const normalizedEntry = normalizeEntry(entry);
   if (!normalizedEntry) throw queueError('queue_entry_invalid', 400);
 
-  const state = await readQueueState(store);
+  const state = await readQueueState(store, now);
   const conflict = findActiveConflict(state.entries, normalizedEntry);
   if (conflict) throw queueError(conflict);
 
@@ -177,14 +239,41 @@ export function selectNextVoteEntry(entries = [], lastClientId = '') {
   return queued[0];
 }
 
+function fairQueuedEntries(entries = [], lastClientId = '') {
+  const queued = entries
+    .filter((entry) => entry?.state === 'queued')
+    .sort(compareQueuedEntries);
+  if (!queued.length) return [];
+
+  const clientOrder = [];
+  for (const entry of queued) {
+    if (!clientOrder.includes(entry.clientId)) clientOrder.push(entry.clientId);
+  }
+
+  const startIndex = lastClientId && clientOrder.includes(lastClientId)
+    ? (clientOrder.indexOf(lastClientId) + 1) % clientOrder.length
+    : 0;
+  const rotatedClients = [
+    ...clientOrder.slice(startIndex),
+    ...clientOrder.slice(0, startIndex),
+  ];
+
+  return rotatedClients.flatMap((clientId) => queued.filter((entry) => entry.clientId === clientId));
+}
+
 export function millisecondsUntilVoteAllowed(state = {}, now = Date.now()) {
   const lastSubmissionAt = normalizeTimestamp(state.lastSubmissionAt);
   if (!lastSubmissionAt) return 0;
   return Math.max(0, VOTE_INTERVAL_MS - (Math.trunc(Number(now)) - lastSubmissionAt));
 }
 
-export async function markVoteEntryProcessing(store = getVoteQueueStore(), entryId, now = Date.now()) {
-  const state = await readQueueState(store);
+export async function markVoteEntryProcessing(
+  store = getVoteQueueStore(),
+  entryId,
+  now = Date.now(),
+  leaseMs = PROCESSING_LEASE_MS,
+) {
+  const state = await readQueueState(store, now);
   if (state.processingId && state.processingId !== entryId) return null;
 
   const entry = state.entries.find((candidate) => candidate.id === entryId);
@@ -192,15 +281,17 @@ export async function markVoteEntryProcessing(store = getVoteQueueStore(), entry
   if (entry.state === 'processing') return entry;
   if (entry.state !== 'queued') return null;
 
+  const processingAt = normalizeTimestamp(now) || Date.now();
   entry.state = 'processing';
-  entry.processingAt = normalizeTimestamp(now) || Date.now();
+  entry.processingAt = processingAt;
+  entry.processingLeaseUntil = processingAt + Math.max(1, Math.trunc(Number(leaseMs)) || PROCESSING_LEASE_MS);
   state.processingId = entry.id;
   await writeQueueState(store, state);
   return clone(entry);
 }
 
-export async function removeVoteEntry(store = getVoteQueueStore(), entryId, completion = {}) {
-  const state = await readQueueState(store);
+export async function removeVoteEntry(store = getVoteQueueStore(), entryId, completion = {}, now = Date.now()) {
+  const state = await readQueueState(store, now);
   const removed = state.entries.find((entry) => entry.id === entryId) || null;
   state.entries = state.entries.filter((entry) => entry.id !== entryId);
 
@@ -234,13 +325,16 @@ function publicEntry(entry, now, position) {
 }
 
 export function publicQueueSnapshot(state = defaultQueueState(), now = Date.now()) {
-  const normalized = normalizeState(state);
-  const entries = activeEntries(normalized.entries)
-    .sort(compareQueuedEntries)
+  const normalized = cleanupStaleProcessing(normalizeState(state), now).state;
+  const processingEntry = normalized.entries.find((entry) => (
+    entry.state === 'processing' && entry.id === normalized.processingId
+  )) || normalized.entries.find((entry) => entry.state === 'processing') || null;
+  const entries = fairQueuedEntries(normalized.entries, normalized.lastClientId)
     .map((entry, index) => publicEntry(entry, now, index + 1));
 
   return {
     entries,
+    processing: processingEntry ? publicEntry(processingEntry, now, 0) : null,
     serverTime: Math.trunc(Number(now)) || Date.now(),
     voteIntervalMs: VOTE_INTERVAL_MS,
     nextAllowedAt: normalized.lastSubmissionAt
@@ -256,43 +350,146 @@ function delay(ms) {
   });
 }
 
-function normalizeRunArguments(storeOrOptions, maybeOptions) {
+function normalizeRunArguments(storeOrOptions, maybeOptions = {}) {
   if (storeOrOptions && typeof storeOrOptions.get === 'function') {
-    return { store: storeOrOptions, ...(maybeOptions || {}) };
+    return { queueStore: storeOrOptions, ...maybeOptions };
   }
-  return { store: getVoteQueueStore(), ...(storeOrOptions || {}) };
+  return { ...(storeOrOptions || {}) };
 }
 
-export async function runQueuedVote(storeOrOptions = getVoteQueueStore(), maybeOptions = {}) {
-  const {
-    store,
-    nowFn = Date.now,
-    sleepFn = delay,
-    submitVote,
-  } = normalizeRunArguments(storeOrOptions, maybeOptions);
+function currentTime(nowFn) {
+  return normalizeTimestamp(nowFn()) || Date.now();
+}
 
-  if (typeof submitVote !== 'function') throw queueError('submitVote_required', 500);
+function waitTimeoutError() {
+  return queueError('queue_wait_timeout', 504);
+}
 
-  let state = await readQueueState(store);
-  const waitMs = millisecondsUntilVoteAllowed(state, nowFn());
-  if (waitMs > 0) await sleepFn(waitMs);
+async function waitWithinBudget({ startedAt, maxWaitMs, nowFn, sleep, waitMs }) {
+  const now = currentTime(nowFn);
+  const elapsed = Math.max(0, now - startedAt);
+  if (elapsed >= maxWaitMs) throw waitTimeoutError();
 
-  state = await readQueueState(store);
-  if (state.processingId) return null;
+  const remaining = maxWaitMs - elapsed;
+  const duration = Math.max(1, Math.min(waitMs || QUEUE_POLL_MS, remaining));
+  await sleep(duration);
+}
 
-  const next = selectNextVoteEntry(state.entries, state.lastClientId);
-  if (!next) return null;
+function isActiveConflictError(error) {
+  return error?.code === 'client_active'
+    || error?.code === 'ip_active'
+    || /client_active|ip_active/.test(String(error?.message || ''));
+}
 
-  const processing = await markVoteEntryProcessing(store, next.id, nowFn());
-  if (!processing) return null;
+export async function runQueuedVote(storeOrOptions = {}, maybeOptions = {}) {
+  const options = normalizeRunArguments(storeOrOptions, maybeOptions);
+  const queueStore = options.queueStore || options.store || getVoteQueueStore();
+  const nowFn = options.nowFn || Date.now;
+  const sleep = options.sleep || options.sleepFn || delay;
+  const submit = options.submit || options.submitVote;
+  const maxWaitMs = Math.max(0, Math.trunc(Number(options.maxWaitMs ?? DEFAULT_MAX_WAIT_MS)));
 
-  const submissionAt = normalizeTimestamp(nowFn()) || Date.now();
+  if (typeof submit !== 'function') throw queueError('submit_required', 500);
+
+  const startedAt = currentTime(nowFn);
+  const entry = createVoteQueueEntry({
+    identity: options.identity,
+    vote: options.vote,
+    now: startedAt,
+    id: options.id || randomUUID(),
+  });
+
+  let enqueued = false;
+  let processing = null;
+
   try {
-    return await submitVote(clone(processing.privateVote), clone(processing));
-  } finally {
-    await removeVoteEntry(store, processing.id, {
-      lastSubmissionAt: submissionAt,
-      lastClientId: processing.clientId,
-    });
+    while (!enqueued) {
+      try {
+        await enqueueVoteEntry(queueStore, entry, currentTime(nowFn));
+        enqueued = true;
+      } catch (error) {
+        if (!isActiveConflictError(error)) throw error;
+        await waitWithinBudget({
+          startedAt,
+          maxWaitMs,
+          nowFn,
+          sleep,
+          waitMs: QUEUE_POLL_MS,
+        });
+      }
+    }
+
+    while (!processing) {
+      const now = currentTime(nowFn);
+      const state = await readQueueState(queueStore, now);
+      const currentEntry = state.entries.find((candidate) => candidate.id === entry.id);
+      if (!currentEntry) throw queueError('queue_entry_missing', 409);
+
+      if (currentEntry.state === 'processing') {
+        processing = clone(currentEntry);
+        break;
+      }
+
+      if (state.processingId) {
+        await waitWithinBudget({
+          startedAt,
+          maxWaitMs,
+          nowFn,
+          sleep,
+          waitMs: QUEUE_POLL_MS,
+        });
+        continue;
+      }
+
+      const next = selectNextVoteEntry(state.entries, state.lastClientId);
+      if (next?.id !== entry.id) {
+        await waitWithinBudget({
+          startedAt,
+          maxWaitMs,
+          nowFn,
+          sleep,
+          waitMs: QUEUE_POLL_MS,
+        });
+        continue;
+      }
+
+      const intervalMs = millisecondsUntilVoteAllowed(state, now);
+      if (intervalMs > 0) {
+        await waitWithinBudget({
+          startedAt,
+          maxWaitMs,
+          nowFn,
+          sleep,
+          waitMs: intervalMs,
+        });
+        continue;
+      }
+
+      processing = await markVoteEntryProcessing(queueStore, entry.id, now);
+      if (!processing) {
+        await waitWithinBudget({
+          startedAt,
+          maxWaitMs,
+          nowFn,
+          sleep,
+          waitMs: QUEUE_POLL_MS,
+        });
+      }
+    }
+
+    const submissionAt = currentTime(nowFn);
+    try {
+      return await submit(clone(processing.privateVote));
+    } finally {
+      await removeVoteEntry(queueStore, processing.id, {
+        lastSubmissionAt: submissionAt,
+        lastClientId: processing.clientId,
+      }, submissionAt);
+    }
+  } catch (error) {
+    if (enqueued && !processing) {
+      await removeVoteEntry(queueStore, entry.id, {}, currentTime(nowFn)).catch(() => {});
+    }
+    throw error;
   }
 }
