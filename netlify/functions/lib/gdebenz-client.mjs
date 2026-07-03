@@ -259,10 +259,11 @@ function splitParam(value) {
 
 export function queryOptions(searchParams) {
   return {
+    source: searchParams.get('source') || 'gdebenz',
     city: searchParams.get('city') || '',
     lat: searchParams.has('lat') ? Number(searchParams.get('lat')) : null,
     lon: searchParams.has('lon') ? Number(searchParams.get('lon')) : null,
-    radius: Number(searchParams.get('radius') || 20),
+    radius: Number(searchParams.get('radius') || 7),
     fuelTypes: splitParam(searchParams.get('fuel')),
     statuses: splitParam(searchParams.get('status')),
     brand: searchParams.get('brand') || '',
@@ -361,7 +362,7 @@ export async function getNearby(lat, lon, radius, fetchImpl = fetch) {
     pathWithParams('/api/nearby', {
       lat: latSnapped.toFixed(2),
       lon: lonSnapped.toFixed(2),
-      radius_km: radius || 20,
+      radius_km: radius || 7,
     }),
     { headers: rt ? { 'x-rt': rt } : {} },
     fetchImpl,
@@ -381,7 +382,7 @@ export async function getStationComments(osmId, fetchImpl = fetch) {
 
 export async function listStations(options, fetchImpl = fetch) {
   const centerCoords = await resolveCoords(options, fetchImpl);
-  const radius = Number.isFinite(options.radius) ? options.radius : 20;
+  const radius = Number.isFinite(options.radius) ? options.radius : 7;
   const { stations, summary } = await getNearby(centerCoords.lat, centerCoords.lon, radius, fetchImpl);
   const filtered = filterStations(stations, options);
 
@@ -397,7 +398,7 @@ export async function listStations(options, fetchImpl = fetch) {
 
 export async function allStationIds(options, fetchImpl = fetch) {
   const centerCoords = await resolveCoords(options, fetchImpl);
-  const radius = Number.isFinite(options.radius) ? options.radius : 20;
+  const radius = Number.isFinite(options.radius) ? options.radius : 7;
   const { stations } = await getNearby(centerCoords.lat, centerCoords.lon, radius, fetchImpl);
   const filtered = filterStations(stations, options);
 
@@ -406,7 +407,7 @@ export async function allStationIds(options, fetchImpl = fetch) {
 
 export async function votePreview(options, fetchImpl = fetch) {
   const centerCoords = await resolveCoords(options, fetchImpl);
-  const radius = Number.isFinite(options.radius) ? options.radius : 20;
+  const radius = Number.isFinite(options.radius) ? options.radius : 7;
   const { stations } = await getNearby(centerCoords.lat, centerCoords.lon, radius, fetchImpl);
   const filtered = filterStations(stations, options);
   const limit = Number.isFinite(options.limit) ? options.limit : 200;

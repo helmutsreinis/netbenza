@@ -1,9 +1,37 @@
 import { STATUSES, resolveCoords, submitVote } from './lib/gdebenz-client.mjs';
+import { BENZIN_STATUSES, submitBenzinReport } from './lib/benzin-client.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/http.mjs';
 
 export default async function handler(req) {
   if (req.method !== 'POST') return methodNotAllowed(['POST']);
   const body = await readJson(req);
+  const source = body.source || 'gdebenz';
+
+  if (source === 'benzin') {
+    if (!BENZIN_STATUSES.includes(body.vote_status)) {
+      return errorResponse(400, `Invalid status: ${body.vote_status}`);
+    }
+    if (!Array.isArray(body.osm_ids)) {
+      return errorResponse(400, 'osm_ids must be an array');
+    }
+    const results = [];
+    for (const osmId of body.osm_ids) {
+      try {
+        results.push(await submitBenzinReport({
+          stationId: String(osmId),
+          status: body.vote_status,
+        }));
+      } catch (error) {
+        results.push({
+          osm_id: String(osmId),
+          name: `Station #${osmId}`,
+          success: false,
+          reason: error.message || 'Vote failed',
+        });
+      }
+    }
+    return jsonResponse(results);
+  }
 
   if (!STATUSES.includes(body.vote_status)) {
     return errorResponse(400, `Invalid status: ${body.vote_status}`);
