@@ -76,7 +76,7 @@ describe('access gate', () => {
     );
   });
 
-  it('issues a token tied to accessSessionId and ipKey with a TTL', async () => {
+  it('issues a token tied to accessSessionId with a TTL', async () => {
     const store = new MemoryAccessGateStore();
     const now = 4_000;
     const challenge = await createAccessChallenge(store, { now });
@@ -84,7 +84,6 @@ describe('access gate', () => {
       challengeId: challenge.challengeId,
       answers: correctAnswers(challenge),
       accessSessionId: 'session-a',
-      ipKey: 'ip:203.0.113.10',
       now: now + 100,
     });
 
@@ -95,7 +94,6 @@ describe('access gate', () => {
     await assert.doesNotReject(assertAccessToken(store, {
       accessToken: issued.accessToken,
       accessSessionId: 'session-a',
-      ipKey: 'ip:203.0.113.10',
       now: now + 200,
     }));
   });
@@ -108,37 +106,31 @@ describe('access gate', () => {
       challengeId: challenge.challengeId,
       answers: correctAnswers(challenge),
       accessSessionId: 'session-a',
-      ipKey: 'ip:one',
       now,
     });
 
     await assert.rejects(
-      assertAccessToken(store, { accessSessionId: 'session-a', ipKey: 'ip:one', now }),
+      assertAccessToken(store, { accessSessionId: 'session-a', now }),
       { status: 401, code: 'access_token_missing' },
     );
     await assert.rejects(
       assertAccessToken(store, {
         accessToken: issued.accessToken,
         accessSessionId: 'session-b',
-        ipKey: 'ip:one',
         now,
       }),
       { status: 401, code: 'access_session_mismatch' },
     );
+    await assert.doesNotReject(assertAccessToken(store, {
+      accessToken: issued.accessToken,
+      accessSessionId: 'session-a',
+      ipKey: 'ip:changed-network',
+      now,
+    }));
     await assert.rejects(
       assertAccessToken(store, {
         accessToken: issued.accessToken,
         accessSessionId: 'session-a',
-        ipKey: 'ip:two',
-        now,
-      }),
-      { status: 401, code: 'access_ip_mismatch' },
-    );
-    await assert.rejects(
-      assertAccessToken(store, {
-        accessToken: issued.accessToken,
-        accessSessionId: 'session-a',
-        ipKey: 'ip:one',
         now: now + ACCESS_TOKEN_TTL_MS + 1,
       }),
       { status: 401, code: 'access_token_expired' },

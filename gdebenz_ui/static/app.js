@@ -19,7 +19,6 @@ const POTEMKIN_STANDBY_MESSAGE = 'Live station data is unavailable for a moment.
 const RESULT_MAP_PIN_COLOR = '#7F1D1D';
 const SESSION_REPLACED_REASONS = new Set([
   'client_replaced',
-  'ip_replaced',
   'invalid_session',
   'inactive_session',
   'not_found',

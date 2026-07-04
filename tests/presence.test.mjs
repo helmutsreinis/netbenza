@@ -558,7 +558,7 @@ describe('presence helpers', () => {
     assert.equal(newRecord.acceptedAt, sessionStartedAt + 1);
   });
 
-  it('keeps only the newest profile for an IP address without exposing the IP', async () => {
+  it('allows same-IP profiles to coexist without exposing the IP', async () => {
     const store = new MemoryPresenceStore();
     const ipHeaders = { 'x-forwarded-for': '198.51.100.24, 10.0.0.1' };
 
@@ -617,19 +617,61 @@ describe('presence helpers', () => {
     const staleJson = await staleResponse.json();
     const serialized = JSON.stringify(staleJson);
 
-    assert.deepEqual(stalePostJson.users.map((user) => user.clientId), ['client-new']);
-    assert.deepEqual(stalePostJson.session, { active: false, reason: 'ip_replaced' });
+    assert.deepEqual(stalePostJson.users.map((user) => user.clientId), ['client-new', 'client-old']);
+    assert.deepEqual(stalePostJson.session, { active: true });
     assert.deepEqual(staleDeleteJson.users.map((user) => user.clientId), ['client-new']);
-    assert.deepEqual(staleDeleteJson.session, { active: false, reason: 'ip_replaced' });
+    assert.deepEqual(staleDeleteJson.session, { active: false, reason: 'not_found' });
     assert.deepEqual(staleJson.users.map((user) => user.clientId), ['client-new']);
-    assert.deepEqual(staleJson.session, { active: false, reason: 'ip_replaced' });
+    assert.deepEqual(staleJson.session, { active: false, reason: 'not_found' });
     assert.equal(await store.get('users/client-old', { type: 'json' }), null);
     assert.equal(staleJson.users[0].ipKey, undefined);
     assert.equal(serialized.includes('198.51.100.24'), false);
     assert.equal(serialized.includes('ip:'), false);
   });
 
-  it('keeps an IP-replaced old profile inactive when it changes sessionId with an older sessionStartedAt', async () => {
+  it('allows multiple active profiles from the same IP address', async () => {
+    const store = new MemoryPresenceStore();
+    const ipHeaders = { 'x-forwarded-for': '198.51.100.24, 10.0.0.1' };
+
+    await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'shared-ip-one',
+        sessionId: 'session-one',
+        sessionStartedAt: 4_000_000,
+        handle: 'Shared One',
+        avatar: '/avatars/one.png',
+        activity: 'online',
+      }),
+    }), store, () => 4_000_000);
+    await handlePresenceRequest(new Request('https://site.test/api/presence', {
+      method: 'POST',
+      headers: ipHeaders,
+      body: JSON.stringify({
+        clientId: 'shared-ip-two',
+        sessionId: 'session-two',
+        sessionStartedAt: 4_001_000,
+        handle: 'Shared Two',
+        avatar: '/avatars/two.png',
+        activity: 'selecting',
+      }),
+    }), store, () => 4_001_000);
+
+    const firstResponse = await handlePresenceRequest(
+      new Request('https://site.test/api/presence?clientId=shared-ip-one&sessionId=session-one', { headers: ipHeaders }),
+      store,
+      () => 4_001_500,
+    );
+    const firstJson = await firstResponse.json();
+
+    assert.deepEqual(firstJson.users.map((user) => user.clientId), ['shared-ip-one', 'shared-ip-two']);
+    assert.deepEqual(firstJson.session, { active: true });
+    assert.equal(JSON.stringify(firstJson).includes('198.51.100.24'), false);
+    assert.equal(JSON.stringify(firstJson).includes('ip:'), false);
+  });
+
+  it('allows an older same-IP profile to stay active with its own clientId', async () => {
     const store = new MemoryPresenceStore();
     const ipHeaders = { 'x-forwarded-for': '198.51.100.99' };
 
@@ -672,11 +714,11 @@ describe('presence helpers', () => {
     }), store, () => 32_000);
     const staleJson = await staleResponse.json();
 
-    assert.deepEqual(staleJson.users.map((user) => user.clientId), ['ip-new-client']);
-    assert.deepEqual(staleJson.session, { active: false, reason: 'ip_replaced' });
+    assert.deepEqual(staleJson.users.map((user) => user.clientId), ['ip-new-client', 'ip-old-client']);
+    assert.deepEqual(staleJson.session, { active: true });
   });
 
-  it('keeps the later accepted same-IP profile active when sessionStartedAt ties', async () => {
+  it('keeps both same-IP profiles active when sessionStartedAt ties', async () => {
     const store = new MemoryPresenceStore();
     const ipHeaders = { 'x-forwarded-for': '198.51.100.101' };
     const sessionStartedAt = 70_000;
@@ -720,11 +762,11 @@ describe('presence helpers', () => {
     }), store, () => sessionStartedAt + 2000);
     const staleJson = await staleResponse.json();
 
-    assert.deepEqual(staleJson.users.map((user) => user.clientId), ['same-ip-new']);
-    assert.deepEqual(staleJson.session, { active: false, reason: 'ip_replaced' });
+    assert.deepEqual(staleJson.users.map((user) => user.clientId), ['same-ip-new', 'same-ip-old']);
+    assert.deepEqual(staleJson.session, { active: true });
   });
 
-  it('clamps future-ish same-IP profile times so later normal profiles can replace them', async () => {
+  it('clamps future-ish same-IP profile times without replacing other profiles', async () => {
     const store = new MemoryPresenceStore();
     const ipHeaders = { 'x-forwarded-for': '198.51.100.102' };
     const now = 80_000;
@@ -779,9 +821,9 @@ describe('presence helpers', () => {
     const normalJson = await normalResponse.json();
 
     assert.equal(futureResponse.status, 200);
-    assert.deepEqual(futureJson.users.map((user) => user.clientId), ['same-ip-future']);
+    assert.deepEqual(futureJson.users.map((user) => user.clientId), ['same-ip-current', 'same-ip-future']);
     assert.equal(futureRecord.sessionStartedAt, futureReceipt);
-    assert.deepEqual(snapshot.users.map((user) => user.clientId), ['same-ip-future']);
+    assert.deepEqual(snapshot.users.map((user) => user.clientId), ['same-ip-current', 'same-ip-future']);
     assert.equal(normalResponse.status, 200);
     assert.deepEqual(normalJson.users.map((user) => user.clientId), ['same-ip-normal']);
     assert.deepEqual(normalJson.session, { active: true });
@@ -930,7 +972,7 @@ describe('presence helpers', () => {
     );
   });
 
-  it('arbitrates snapshots through the active IP mapping when stale records remain', async () => {
+  it('ignores stale IP mappings when building presence snapshots', async () => {
     const store = new MemoryPresenceStore();
     const now = 7_000_000;
     const ipKey = 'ip:shared-arbitration';
@@ -984,8 +1026,8 @@ describe('presence helpers', () => {
       ipKey,
     });
 
-    assert.deepEqual(snapshot.users.map((user) => user.clientId), ['ip-new']);
-    assert.deepEqual(snapshot.session, { active: false, reason: 'ip_replaced' });
+    assert.deepEqual(snapshot.users.map((user) => user.clientId), ['ip-new', 'ip-old']);
+    assert.deepEqual(snapshot.session, { active: true });
     assert.equal(JSON.stringify(snapshot).includes(ipKey), false);
   });
 });

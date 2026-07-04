@@ -68,7 +68,6 @@ const SAFE_ROUTE_ERROR_DETAILS = new Set([
   'chat_text_required',
   'client_replaced',
   'invalid_session',
-  'ip_replaced',
   'not_found',
 ]);
 

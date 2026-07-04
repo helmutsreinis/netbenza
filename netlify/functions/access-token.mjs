@@ -5,7 +5,6 @@ import {
   publicChallenge,
 } from './lib/access-gate-store.mjs';
 import { errorResponse, jsonResponse, methodNotAllowed, readJson } from './lib/http.mjs';
-import { requestIpKey } from './lib/request-context.mjs';
 
 export async function handleAccessTokenRequest(req, options = {}) {
   const store = options.store || getAccessGateStore();
@@ -23,7 +22,6 @@ export async function handleAccessTokenRequest(req, options = {}) {
         challengeId: body.challengeId,
         answers: body.answers || {},
         accessSessionId: body.accessSessionId,
-        ipKey: requestIpKey(req),
         now: now(),
       }));
     } catch (error) {

@@ -2,8 +2,6 @@ import { randomBytes, randomUUID } from 'node:crypto';
 
 import { getStore } from '@netlify/blobs';
 
-import { requestIpKey } from './request-context.mjs';
-
 export const ACCESS_TOKEN_TTL_MS = 6 * 60 * 60 * 1000;
 export const ACCESS_CHALLENGE_TTL_MS = 10 * 60 * 1000;
 
@@ -136,7 +134,7 @@ export function validateAccessAnswers(challenge, answers = {}) {
 
 export async function issueAccessToken(store, options = {}) {
   const now = options.now ?? Date.now();
-  const { challengeId, answers, accessSessionId, ipKey } = options;
+  const { challengeId, answers, accessSessionId } = options;
   if (!accessSessionId) throw accessError(400, 'access_session_missing');
 
   const challenge = challengeId
@@ -155,7 +153,6 @@ export async function issueAccessToken(store, options = {}) {
   const token = {
     accessToken,
     accessSessionId,
-    ipKey: ipKey || 'ip:local',
     issuedAt: now,
     expiresAt: now + ACCESS_TOKEN_TTL_MS,
   };
@@ -167,7 +164,7 @@ export async function issueAccessToken(store, options = {}) {
 
 export async function assertAccessToken(store, options = {}) {
   const now = options.now ?? Date.now();
-  const { accessToken, accessSessionId, ipKey } = options;
+  const { accessToken, accessSessionId } = options;
   if (!accessToken) throw accessError(401, 'access_token_missing');
   if (!accessSessionId) throw accessError(401, 'access_session_missing');
 
@@ -179,9 +176,6 @@ export async function assertAccessToken(store, options = {}) {
   }
   if (token.accessSessionId !== accessSessionId) {
     throw accessError(401, 'access_session_mismatch');
-  }
-  if (token.ipKey !== ipKey) {
-    throw accessError(401, 'access_ip_mismatch');
   }
 
   return token;
@@ -195,7 +189,6 @@ export async function assertRequestAccess(req, options = {}) {
   const tokenOptions = {
     accessToken,
     accessSessionId,
-    ipKey: requestIpKey(req),
     now,
   };
   if (!accessToken || !accessSessionId) return assertAccessToken(null, tokenOptions);

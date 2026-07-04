@@ -349,6 +349,7 @@ describe('Netlify vote queue routes', () => {
     });
 
     await enqueueVoteEntry(queueStore, blocker, now);
+    await markVoteEntryProcessing(queueStore, blocker.id, now);
     await activatePresence({
       store: presenceStore,
       headers: access.headers,

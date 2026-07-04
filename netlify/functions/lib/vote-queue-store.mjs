@@ -299,7 +299,6 @@ function activeEntries(entries = []) {
 function findActiveConflict(entries, entry) {
   const active = activeEntries(entries);
   if (active.some((candidate) => candidate.clientId === entry.clientId)) return 'client_active';
-  if (active.some((candidate) => candidate.ipKey === entry.ipKey)) return 'ip_active';
   return '';
 }
 
@@ -328,9 +327,6 @@ async function reconcileActiveEntry(store, entry, now) {
   const sameClient = active
     .filter((candidate) => candidate.clientId === entry.clientId)
     .sort(entryOrder);
-  const sameIp = active
-    .filter((candidate) => candidate.ipKey === entry.ipKey)
-    .sort(entryOrder);
 
   const clientWinner = sameClient[0];
   if (clientWinner && clientWinner.id !== entry.id) {
@@ -338,13 +334,7 @@ async function reconcileActiveEntry(store, entry, now) {
     throw queueError('client_active');
   }
 
-  const ipWinner = sameIp[0];
-  if (ipWinner && ipWinner.id !== entry.id) {
-    await deleteQueueEntry(store, entry.id);
-    throw queueError('ip_active');
-  }
-
-  const losers = [...sameClient, ...sameIp]
+  const losers = sameClient
     .filter((candidate) => candidate.id !== entry.id);
   await Promise.all([...new Set(losers.map((candidate) => candidate.id))]
     .map((entryId) => deleteQueueEntry(store, entryId)));
@@ -595,8 +585,7 @@ async function waitWithinBudget({ startedAt, maxWaitMs, nowFn, sleep, waitMs }) 
 
 function isActiveConflictError(error) {
   return error?.code === 'client_active'
-    || error?.code === 'ip_active'
-    || /client_active|ip_active/.test(String(error?.message || ''));
+    || /client_active/.test(String(error?.message || ''));
 }
 
 export async function runQueuedVote(storeOrOptions = {}, maybeOptions = {}) {

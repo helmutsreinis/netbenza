@@ -247,7 +247,7 @@ describe('vote queue store', () => {
     assert.equal(await store.get('queue/legacy-migrated', { type: 'json' }), null);
   });
 
-  it('allows one active queued or processing vote per clientId and per ipKey', async () => {
+  it('allows one active queued or processing vote per clientId while sharing IPs', async () => {
     const store = new MemoryPresenceStore();
     const now = Date.now();
     const first = createVoteQueueEntry({
@@ -271,11 +271,40 @@ describe('vote queue store', () => {
 
     await enqueueVoteEntry(store, first);
     await assert.rejects(() => enqueueVoteEntry(store, secondSameClient), /client_active/);
-    await assert.rejects(() => enqueueVoteEntry(store, thirdSameIp), /ip_active/);
+    await enqueueVoteEntry(store, thirdSameIp);
 
     await markVoteEntryProcessing(store, first.id, now + 3);
     await assert.rejects(() => enqueueVoteEntry(store, secondSameClient), /client_active/);
-    await assert.rejects(() => enqueueVoteEntry(store, thirdSameIp), /ip_active/);
+    assert.deepEqual((await readQueueState(store, now + 4)).entries.map((entry) => entry.id).sort(), [
+      'first',
+      'third',
+    ]);
+  });
+
+  it('allows different clientIds from the same IP to queue votes', async () => {
+    const store = new MemoryPresenceStore();
+    const now = Date.now();
+    const first = createVoteQueueEntry({
+      identity: alice,
+      vote: vote({ osmId: '101' }),
+      now,
+      id: 'same-ip-first',
+    });
+    const secondSameIp = createVoteQueueEntry({
+      identity: { ...bob, ipKey: alice.ipKey },
+      vote: vote({ osmId: '201', status: 'no' }),
+      now: now + 1,
+      id: 'same-ip-second',
+    });
+
+    await enqueueVoteEntry(store, first);
+    await enqueueVoteEntry(store, secondSameIp);
+
+    const state = await readQueueState(store, now + 2);
+    assert.deepEqual(state.entries.map((entry) => entry.id).sort(), [
+      'same-ip-first',
+      'same-ip-second',
+    ]);
   });
 
   it('keeps concurrent enqueues from different users instead of losing one write', async () => {
@@ -562,7 +591,7 @@ describe('vote queue store', () => {
     assert.equal(state.processingId, '');
   });
 
-  it('stale processing lease does not freeze queue or active client/ip forever', async () => {
+  it('stale processing lease does not freeze queue or active client forever', async () => {
     const store = new MemoryPresenceStore();
     const processingAt = 50_000;
     const staleNow = processingAt + PROCESSING_LEASE_MS + 1;
