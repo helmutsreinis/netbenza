@@ -577,6 +577,58 @@ describe('frontend DOM updates', () => {
     assert.match(dom.window.document.getElementById('chat-messages')?.textContent || '', /hello chat/);
   });
 
+  it('shows chat rate warning and ban messages from server responses', async () => {
+    const responses = [
+      {
+        detail: 'chat_rate_limited',
+        warnings: 1,
+        warningsRemaining: 2,
+        limit: 2,
+        windowMs: 60_000,
+        retryAfterMs: 58_000,
+      },
+      {
+        detail: 'chat_banned',
+        warnings: 3,
+        warningsRemaining: 0,
+        limit: 2,
+        windowMs: 60_000,
+        retryAfterMs: 600_000,
+        bannedUntil: 700_000,
+      },
+    ];
+    const { context, dom } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        if (String(url) === '/api/chat' && options.method === 'POST') {
+          const body = responses.shift();
+          return { ok: false, status: 429, json: async () => body };
+        }
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    vm.runInContext(`
+      state.identity = {
+        clientId: 'client-chat-limit',
+        sessionId: 'session-chat-limit',
+        sessionStartedAt: 12345,
+        fingerprint: 'fingerprint-chat-limit',
+        handle: 'Chat Limit',
+        avatar: '/avatars/chat.png'
+      };
+      document.getElementById('chat-input').value = 'too fast';
+    `, context);
+
+    await vm.runInContext('sendChatMessage(new window.Event("submit"))', context);
+    assert.match(dom.window.document.getElementById('toast')?.textContent || '', /Warning 1\/3/);
+    assert.match(dom.window.document.getElementById('toast')?.textContent || '', /2 messages per minute/);
+
+    vm.runInContext("document.getElementById('chat-input').value = 'still too fast';", context);
+    await vm.runInContext('sendChatMessage(new window.Event("submit"))', context);
+    assert.match(dom.window.document.getElementById('toast')?.textContent || '', /Chat banned/);
+    assert.match(dom.window.document.getElementById('toast')?.textContent || '', /10m/);
+  });
+
   it('polls chat with the active session identity in the query string', async () => {
     const chatUrls = [];
     const { context, dom } = loadFrontendHarness({

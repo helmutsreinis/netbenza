@@ -65,6 +65,8 @@ async function activeChatIdentity(req, body, options, now) {
 const SAFE_ROUTE_ERROR_DETAILS = new Set([
   'blob_read_failed',
   'blob_write_failed',
+  'chat_banned',
+  'chat_rate_limited',
   'chat_text_required',
   'client_replaced',
   'invalid_session',
@@ -80,7 +82,26 @@ function safeRouteErrorDetail(error) {
 function chatRouteErrorResponse(error) {
   const status = Number(error?.status);
   const responseStatus = Number.isInteger(status) && status >= 400 ? status : 503;
-  return errorResponse(responseStatus, safeRouteErrorDetail(error));
+  const detail = safeRouteErrorDetail(error);
+  const body = { detail };
+  const retryAfterMs = Math.max(0, Math.trunc(Number(error?.retryAfterMs || 0)) || 0);
+  const headers = {};
+
+  if (detail === 'chat_rate_limited' || detail === 'chat_banned') {
+    body.warnings = Math.max(0, Math.trunc(Number(error?.warnings || 0)) || 0);
+    body.warningsRemaining = Math.max(0, Math.trunc(Number(error?.warningsRemaining || 0)) || 0);
+    body.limit = Math.max(0, Math.trunc(Number(error?.limit || 0)) || 0);
+    body.windowMs = Math.max(0, Math.trunc(Number(error?.windowMs || 0)) || 0);
+    if (retryAfterMs) {
+      body.retryAfterMs = retryAfterMs;
+      headers['retry-after'] = String(Math.ceil(retryAfterMs / 1000));
+    }
+    if (detail === 'chat_banned') {
+      body.bannedUntil = Math.max(0, Math.trunc(Number(error?.bannedUntil || 0)) || 0);
+    }
+  }
+
+  return jsonResponse(body, { status: responseStatus, headers });
 }
 
 export async function handleChatRequest(req, options = {}) {
@@ -98,7 +119,7 @@ export async function handleChatRequest(req, options = {}) {
   if (req.method === 'GET') {
     try {
       await activeChatIdentity(req, {}, options, now);
-      return jsonResponse(publicChatSnapshot(await readChatState(chatStore), now));
+      return jsonResponse(publicChatSnapshot(await readChatState(chatStore, now), now));
     } catch (error) {
       return chatRouteErrorResponse(error);
     }

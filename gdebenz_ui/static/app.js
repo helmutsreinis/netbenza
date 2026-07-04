@@ -133,6 +133,7 @@ async function api(path, opts = {}) {
     const error = new Error(detail);
     error.status = res.status;
     error.detail = detail;
+    error.body = err;
     if (res.status === 401) {
       error.accessDenied = true;
       await showAccessGateAfterDenied();
@@ -920,10 +921,34 @@ async function sendChatMessage(event) {
     input.value = '';
     renderChatMessages(data.messages || []);
   } catch (e) {
-    if (!isSessionReplacementError(e)) toast('Chat failed: ' + e.message);
+    if (!isSessionReplacementError(e)) toast(chatFailureMessage(e));
   } finally {
     setChatSending(false);
   }
+}
+
+function chatFailureMessage(error) {
+  const detail = error?.detail || error?.message || '';
+  const body = error?.body || {};
+  if (detail === 'chat_rate_limited') {
+    const warnings = Number(body.warnings || 0);
+    const retry = body.retryAfterMs ? ` Try again in ${formatDuration(body.retryAfterMs)}.` : '';
+    return `Warning ${warnings}/3: max 2 messages per minute.${retry}`;
+  }
+  if (detail === 'chat_banned') {
+    const retry = body.retryAfterMs ? ` for ${formatDuration(body.retryAfterMs)}` : '';
+    return `Chat banned${retry}.`;
+  }
+  return 'Chat failed: ' + (error?.message || 'chat_failed');
+}
+
+function formatDuration(ms) {
+  const seconds = Math.max(1, Math.ceil(Number(ms || 0) / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (minutes && remainder) return `${minutes}m ${remainder}s`;
+  if (minutes) return `${minutes}m`;
+  return `${seconds}s`;
 }
 
 function renderChatMessages(messages = []) {

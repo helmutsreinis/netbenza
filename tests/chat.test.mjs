@@ -11,6 +11,10 @@ import {
 } from '../netlify/functions/lib/presence-store.mjs';
 import {
   CHAT_MAX_MESSAGES,
+  CHAT_RATE_LIMIT_BAN_MS,
+  CHAT_RATE_LIMIT_MAX_MESSAGES,
+  CHAT_RATE_LIMIT_MAX_WARNINGS,
+  CHAT_RATE_LIMIT_WINDOW_MS,
   appendChatMessage,
   normalizeChatText,
   publicChatSnapshot,
@@ -115,7 +119,10 @@ describe('chat store', () => {
     };
 
     for (let index = 1; index <= 55; index += 1) {
-      await appendChatMessage(store, identity, ` message ${index} `, 10_000 + index, `message-${index}`);
+      await appendChatMessage(store, {
+        ...identity,
+        sessionId: `secret-session-${index}`,
+      }, ` message ${index} `, 10_000 + index, `message-${index}`);
     }
 
     const state = await readChatState(store);
@@ -139,6 +146,66 @@ describe('chat store', () => {
     assert.equal(serialized.includes('ip:'), false);
     assert.equal(serialized.includes('accessToken'), false);
     assert.equal(serialized.includes('203.0.113.7'), false);
+  });
+
+  it('allows only two messages per session per minute before warnings and a temporary ban', async () => {
+    const store = new MemoryPresenceStore();
+    const now = 5_000_000;
+    const identity = {
+      clientId: 'client-one',
+      sessionId: 'rate-session',
+      ipKey: 'ip:203.0.113.7',
+      handle: 'Alice',
+      avatar: '/avatars/alice.png',
+    };
+
+    await appendChatMessage(store, identity, 'one', now, 'rate-one');
+    await appendChatMessage(store, identity, 'two', now + 1_000, 'rate-two');
+
+    for (let warning = 1; warning <= CHAT_RATE_LIMIT_MAX_WARNINGS; warning += 1) {
+      await assert.rejects(
+        appendChatMessage(store, identity, `blocked ${warning}`, now + 2_000 + warning, `rate-blocked-${warning}`),
+        (error) => {
+          assert.equal(error.code, 'chat_rate_limited');
+          assert.equal(error.status, 429);
+          assert.equal(error.warnings, warning);
+          assert.equal(error.warningsRemaining, CHAT_RATE_LIMIT_MAX_WARNINGS - warning);
+          assert.equal(error.retryAfterMs > 0, true);
+          return true;
+        },
+      );
+    }
+
+    await assert.rejects(
+      appendChatMessage(store, identity, 'banned now', now + 10_000, 'rate-banned'),
+      (error) => {
+        assert.equal(error.code, 'chat_banned');
+        assert.equal(error.status, 429);
+        assert.equal(error.bannedUntil, now + 10_000 + CHAT_RATE_LIMIT_BAN_MS);
+        assert.equal(error.retryAfterMs, CHAT_RATE_LIMIT_BAN_MS);
+        return true;
+      },
+    );
+
+    await assert.rejects(
+      appendChatMessage(store, identity, 'still banned', now + CHAT_RATE_LIMIT_WINDOW_MS + 1, 'rate-still-banned'),
+      (error) => {
+        assert.equal(error.code, 'chat_banned');
+        assert.equal(error.status, 429);
+        assert.equal(error.retryAfterMs > CHAT_RATE_LIMIT_BAN_MS - CHAT_RATE_LIMIT_WINDOW_MS, true);
+        return true;
+      },
+    );
+
+    await appendChatMessage(store, identity, 'after ban', now + 10_000 + CHAT_RATE_LIMIT_BAN_MS + 1, 'rate-after-ban');
+    const state = await readChatState(store);
+    const prunedState = await readChatState(
+      store,
+      now + 10_000 + (CHAT_RATE_LIMIT_BAN_MS * 2) + CHAT_RATE_LIMIT_WINDOW_MS + 2,
+    );
+
+    assert.deepEqual(state.messages.map((message) => message.id), ['rate-one', 'rate-two', 'rate-after-ban']);
+    assert.deepEqual(prunedState.rateLimits, {});
   });
 });
 
@@ -332,6 +399,68 @@ describe('Netlify chat route', () => {
     assert.equal(state.messages[0].sessionId, 'tab:one-active');
     assert.equal(state.messages[0].handle, 'Canonical Operator');
     assert.equal(state.messages[0].avatar, '/avatars/canonical.png');
+  });
+
+  it('POST returns warnings and a temporary ban when a session exceeds chat rate limits', async () => {
+    const now = 2_350_000;
+    const access = await accessContext({ now, ip: '198.51.100.58' });
+    const presenceStore = new MemoryPresenceStore();
+    const chatStore = new MemoryPresenceStore();
+
+    await activatePresence({
+      store: presenceStore,
+      headers: access.headers,
+      now,
+      clientId: 'client-one',
+      sessionId: 'session-one',
+      handle: 'Rate Operator',
+      avatar: '/avatars/rate.png',
+    });
+
+    async function postChat(text, at, id) {
+      return handleChatRequest(new Request('https://site.test/api/chat', {
+        method: 'POST',
+        headers: { ...access.headers, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          clientId: 'client-one',
+          sessionId: 'session-one',
+          text,
+        }),
+      }), {
+        accessStore: access.store,
+        presenceStore,
+        chatStore,
+        nowFn: () => at,
+        id,
+      });
+    }
+
+    assert.equal((await postChat('one', now + 1_000, 'route-rate-one')).status, 200);
+    assert.equal((await postChat('two', now + 2_000, 'route-rate-two')).status, 200);
+
+    const warningResponse = await postChat('three', now + 3_000, 'route-rate-three');
+    const warningBody = await warningResponse.json();
+
+    assert.equal(warningResponse.status, 429);
+    assert.equal(warningBody.detail, 'chat_rate_limited');
+    assert.equal(warningBody.warnings, 1);
+    assert.equal(warningBody.warningsRemaining, CHAT_RATE_LIMIT_MAX_WARNINGS - 1);
+    assert.equal(warningBody.limit, CHAT_RATE_LIMIT_MAX_MESSAGES);
+    assert.equal(warningBody.windowMs, CHAT_RATE_LIMIT_WINDOW_MS);
+
+    await postChat('four', now + 4_000, 'route-rate-four');
+    await postChat('five', now + 5_000, 'route-rate-five');
+
+    const bannedResponse = await postChat('six', now + 6_000, 'route-rate-six');
+    const bannedBody = await bannedResponse.json();
+    const state = await readChatState(chatStore);
+
+    assert.equal(bannedResponse.status, 429);
+    assert.equal(bannedBody.detail, 'chat_banned');
+    assert.equal(bannedBody.retryAfterMs, CHAT_RATE_LIMIT_BAN_MS);
+    assert.equal(bannedBody.bannedUntil, now + 6_000 + CHAT_RATE_LIMIT_BAN_MS);
+    assert.equal(bannedResponse.headers.get('retry-after'), '600');
+    assert.deepEqual(state.messages.map((message) => message.id), ['route-rate-one', 'route-rate-two']);
   });
 
   it('POST stale session returns 409 and does not append', async () => {
