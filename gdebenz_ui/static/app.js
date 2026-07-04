@@ -74,6 +74,7 @@ const state = {
   presenceUsers: [],
   presenceHeartbeat: null,
   presencePoll: null,
+  presenceStartId: 0,
   presencePushTimer: null,
   voteQueuePoll: null,
   chatPoll: null,
@@ -609,14 +610,22 @@ function randomHex(bytes) {
 function startPresence() {
   if (state.sessionBlocked) return;
   stopPresenceTimers();
-  postPresence(true);
-  pollPresence();
-  startCollaborationPolling();
-  state.presenceHeartbeat = setInterval(() => postPresence(true), PRESENCE_HEARTBEAT_MS);
-  state.presencePoll = setInterval(pollPresence, PRESENCE_POLL_MS);
+  const startId = state.presenceStartId + 1;
+  const sessionId = state.identity?.sessionId || '';
+  state.presenceStartId = startId;
+
+  postPresence(true).then((ready) => {
+    if (!ready || state.sessionBlocked || state.presenceStartId !== startId) return;
+    if (!state.identity || state.identity.sessionId !== sessionId) return;
+    pollPresence();
+    startCollaborationPolling();
+    state.presenceHeartbeat = setInterval(() => postPresence(true), PRESENCE_HEARTBEAT_MS);
+    state.presencePoll = setInterval(pollPresence, PRESENCE_POLL_MS);
+  });
 }
 
 function stopPresenceTimers() {
+  state.presenceStartId += 1;
   clearInterval(state.presenceHeartbeat);
   clearInterval(state.presencePoll);
   clearTimeout(state.presencePushTimer);
@@ -659,7 +668,7 @@ function requestPresenceSync(force = false) {
 
 async function postPresence() {
   const identity = ensurePresenceSession();
-  if (!identity || state.sessionBlocked) return;
+  if (!identity || state.sessionBlocked) return false;
   state.lastPresencePost = Date.now();
   try {
     const data = await api('/api/presence', {
@@ -674,26 +683,28 @@ async function postPresence() {
         detail: state.activityDetail,
       }),
     });
-    handlePresencePayload(data);
+    return handlePresencePayload(data);
   } catch (e) {
-    if (isSessionReplacementError(e)) return;
+    if (isSessionReplacementError(e) || e.accessDenied) return false;
     renderOnlineUsers(state.presenceUsers);
+    return true;
   }
 }
 
 async function pollPresence() {
   const identity = ensurePresenceSession();
-  if (!identity || state.sessionBlocked) return;
+  if (!identity || state.sessionBlocked) return false;
   try {
     const params = new URLSearchParams({
       clientId: identity.clientId,
       sessionId: identity.sessionId,
     });
     const data = await api(`/api/presence?${params}`);
-    handlePresencePayload(data);
+    return handlePresencePayload(data);
   } catch (e) {
-    if (isSessionReplacementError(e)) return;
+    if (isSessionReplacementError(e) || e.accessDenied) return false;
     renderOnlineUsers(state.presenceUsers);
+    return true;
   }
 }
 

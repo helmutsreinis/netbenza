@@ -270,6 +270,53 @@ describe('frontend DOM updates', () => {
     }
   });
 
+  it('waits for the initial presence POST before polling the new session', async () => {
+    let resolvePresencePost;
+    const presencePostResponse = new Promise((resolve) => {
+      resolvePresencePost = () => resolve({ ok: true, json: async () => ({ users: [], session: { active: true } }) });
+    });
+    const presenceGets = [];
+    const { context } = loadFrontendHarness({
+      fetch: async (url, options = {}) => {
+        const path = String(url);
+        if (path === '/api/presence' && options.method === 'POST') return presencePostResponse;
+        if (path.startsWith('/api/presence?')) {
+          presenceGets.push({ url: path, options });
+          return {
+            ok: true,
+            json: async () => ({ users: [], session: { active: false, reason: 'client_replaced' } }),
+          };
+        }
+        if (path.startsWith('/api/vote/queue')) return { ok: true, json: async () => ({ entries: [], processing: null }) };
+        if (path.startsWith('/api/chat')) return { ok: true, json: async () => ({ messages: [] }) };
+        return { ok: true, json: async () => ({ fuel_grades: [], statuses: [], cities: [], brands: [] }) };
+      },
+    });
+
+    try {
+      vm.runInContext(`
+        state.identity = {
+          clientId: 'race-client',
+          fingerprint: 'race-fingerprint',
+          handle: 'Race Client',
+          avatar: '/avatars/a.png',
+          sessionId: 'race-session-new',
+          sessionStartedAt: 12345
+        };
+        startPresence();
+      `, context);
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(presenceGets.length, 0);
+
+      resolvePresencePost();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.equal(presenceGets.length, 1);
+    } finally {
+      vm.runInContext('stopPresenceTimers()', context);
+    }
+  });
+
   it('keeps split vote counters after updating vote button state', () => {
     const { context, dom } = loadFrontendHarness();
 
