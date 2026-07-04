@@ -10,6 +10,7 @@ const QUEUE_ENTRY_PREFIX = 'queue/entries/';
 const LEGACY_QUEUE_STATE_KEY = 'queue/state';
 const LEGACY_MIGRATED_KEY = 'queue/legacy-migrated';
 const ACTIVE_STATES = new Set(['queued', 'processing']);
+const PUBLIC_QUEUE_MAX_ROWS = 10;
 const QUEUE_POLL_MS = 100;
 const DEFAULT_MAX_WAIT_MS = 60_000;
 let processingClaimCounter = 0;
@@ -537,7 +538,9 @@ export function publicQueueSnapshot(state = defaultQueueState(), now = Date.now(
   const processingEntry = normalized.entries.find((entry) => (
     entry.state === 'processing' && entry.id === normalized.processingId
   )) || normalized.entries.find((entry) => entry.state === 'processing') || null;
+  const publicEntryLimit = Math.max(0, PUBLIC_QUEUE_MAX_ROWS - (processingEntry ? 1 : 0));
   const entries = fairQueuedEntries(normalized.entries, normalized.lastClientId)
+    .slice(0, publicEntryLimit)
     .map((entry, index) => publicEntry(entry, now, index + 1));
 
   return {

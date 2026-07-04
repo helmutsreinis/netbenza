@@ -10,6 +10,7 @@ import {
   handlePresenceRequest,
 } from '../netlify/functions/lib/presence-store.mjs';
 import {
+  CHAT_MAX_MESSAGES,
   appendChatMessage,
   normalizeChatText,
   publicChatSnapshot,
@@ -103,7 +104,7 @@ describe('chat store', () => {
     assert.equal(normalizeChatText(' \n\t '), '');
   });
 
-  it('appendChatMessage keeps only the latest 50 messages and public snapshot omits private fields', async () => {
+  it('appendChatMessage keeps only the latest 10 messages and public snapshot omits private fields', async () => {
     const store = new MemoryPresenceStore();
     const identity = {
       clientId: 'client-one',
@@ -121,8 +122,8 @@ describe('chat store', () => {
     const snapshot = publicChatSnapshot(state, 20_000);
     const serialized = JSON.stringify(snapshot);
 
-    assert.equal(state.messages.length, 50);
-    assert.equal(state.messages[0].id, 'message-6');
+    assert.equal(state.messages.length, CHAT_MAX_MESSAGES);
+    assert.equal(state.messages[0].id, 'message-46');
     assert.equal(state.messages.at(-1).id, 'message-55');
     assert.deepEqual(Object.keys(snapshot.messages[0]).sort(), [
       'avatar',
@@ -132,7 +133,8 @@ describe('chat store', () => {
       'id',
       'text',
     ]);
-    assert.equal(snapshot.messages[0].text, 'message 6');
+    assert.equal(snapshot.messages.length, CHAT_MAX_MESSAGES);
+    assert.equal(snapshot.messages[0].text, 'message 46');
     assert.equal(serialized.includes('secret-session'), false);
     assert.equal(serialized.includes('ip:'), false);
     assert.equal(serialized.includes('accessToken'), false);

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { getStore } from '@netlify/blobs';
 
-export const CHAT_MAX_MESSAGES = 50;
+export const CHAT_MAX_MESSAGES = 10;
 export const CHAT_MAX_TEXT_LENGTH = 240;
 
 const CHAT_STATE_KEY = 'chat/state';

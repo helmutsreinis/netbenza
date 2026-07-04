@@ -704,6 +704,83 @@ describe('vote queue store', () => {
     assert.deepEqual(snapshot.entries.map((entry) => entry.position), [1, 2, 3, 4, 5]);
   });
 
+  it('limits the public queue snapshot to the first 10 visible queued entries', () => {
+    const entries = Array.from({ length: 12 }, (_, index) => createVoteQueueEntry({
+      identity: {
+        clientId: `client-${String(index + 1).padStart(2, '0')}`,
+        sessionId: `session-${index + 1}`,
+        ipKey: `ip:203.0.113.${index + 10}`,
+        handle: `Client ${index + 1}`,
+        avatar: '/avatars/a.png',
+      },
+      vote: vote({ osmId: String(100 + index) }),
+      now: 1_000 + index,
+      id: `entry-${String(index + 1).padStart(2, '0')}`,
+    }));
+
+    const snapshot = publicQueueSnapshot({
+      entries,
+      lastSubmissionAt: 0,
+      lastClientId: '',
+      processingId: '',
+    }, 5_000);
+
+    assert.equal(snapshot.entries.length, 10);
+    assert.deepEqual(snapshot.entries.map((entry) => entry.id), [
+      'entry-01',
+      'entry-02',
+      'entry-03',
+      'entry-04',
+      'entry-05',
+      'entry-06',
+      'entry-07',
+      'entry-08',
+      'entry-09',
+      'entry-10',
+    ]);
+    assert.deepEqual(snapshot.entries.map((entry) => entry.position), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
+  it('limits the public queue snapshot to 10 visible rows including processing', () => {
+    const processing = {
+      ...createVoteQueueEntry({
+        identity: alice,
+        vote: vote({ osmId: '999' }),
+        now: 900,
+        id: 'processing-visible',
+      }),
+      state: 'processing',
+      processingAt: 2_000,
+    };
+    const entries = [
+      processing,
+      ...Array.from({ length: 12 }, (_, index) => createVoteQueueEntry({
+        identity: {
+          clientId: `visible-client-${String(index + 1).padStart(2, '0')}`,
+          sessionId: `visible-session-${index + 1}`,
+          ipKey: `ip:198.51.100.${index + 10}`,
+          handle: `Visible ${index + 1}`,
+          avatar: '/avatars/a.png',
+        },
+        vote: vote({ osmId: String(200 + index) }),
+        now: 1_000 + index,
+        id: `visible-entry-${String(index + 1).padStart(2, '0')}`,
+      })),
+    ];
+
+    const snapshot = publicQueueSnapshot({
+      entries,
+      lastSubmissionAt: 0,
+      lastClientId: '',
+      processingId: 'processing-visible',
+    }, 5_000);
+
+    assert.equal(snapshot.processing.id, 'processing-visible');
+    assert.equal(snapshot.entries.length, 9);
+    assert.equal(snapshot.processing.position, 0);
+    assert.deepEqual(snapshot.entries.map((entry) => entry.position), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  });
+
   it('exposes processing item separately without private fields', () => {
     const processing = {
       ...createVoteQueueEntry({
