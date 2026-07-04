@@ -108,6 +108,17 @@ function loadFrontendHarness(options = {}) {
 }
 
 describe('frontend DOM updates', () => {
+  it('marks the GdeBenz Voter service card as live in the static launcher', () => {
+    const html = readFileSync('gdebenz_ui/static/index.html', 'utf8');
+    const dom = new JSDOM(html);
+    const card = dom.window.document.getElementById('service-gdebenz-card');
+    const status = card?.querySelector('.service-card-status');
+
+    assert.equal(status?.textContent?.trim(), 'Live');
+    assert.equal(status?.classList.contains('service-card-status-offline'), false);
+    assert.match(card?.textContent || '', /GdeBenz is available/i);
+  });
+
   it('renders server-provided access questions and answer order', () => {
     const { context, dom } = loadFrontendHarness();
 
